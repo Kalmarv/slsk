@@ -134,6 +134,11 @@ func (c *Client) LoggedIn() bool {
 	return c.loggedIn.Load()
 }
 
+// ListenPort returns the configured listen port for incoming peer connections.
+func (c *Client) ListenPort() uint32 {
+	return c.cfg.ListenPort
+}
+
 // Search sends a file search request to the server.
 func (c *Client) Search(token uint32, query string) error {
 	if !c.loggedIn.Load() {

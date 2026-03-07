@@ -65,6 +65,11 @@ func (c *Conn) WriteMessage(msg []byte) error {
 	return err
 }
 
+// Raw returns the underlying net.Conn for unframed I/O (e.g., file transfers).
+func (c *Conn) Raw() net.Conn {
+	return c.raw
+}
+
 // Close closes the underlying connection.
 func (c *Conn) Close() error {
 	return c.raw.Close()
