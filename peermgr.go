@@ -35,12 +35,21 @@ type PeerManager struct {
 }
 
 // NewPeerManager creates a new PeerManager with the given username and client.
+// It registers for ConnectToPeer server messages to handle indirect peer connections
+// (NAT traversal: peer asks server to tell us to connect to them).
 func NewPeerManager(username string, client *Client) *PeerManager {
-	return &PeerManager{
+	pm := &PeerManager{
 		username:      username,
 		client:        client,
 		pendingTokens: make(map[uint32]chan *PeerConn),
 	}
+
+	// Handle ConnectToPeer from server: a peer wants us to connect to them.
+	client.OnConnectToPeer(func(resp *ConnectToPeerResponse) {
+		go pm.handleConnectToPeer(resp)
+	})
+
+	return pm
 }
 
 // OnPeerConnection registers handler for incoming P-type connections.
@@ -254,6 +263,58 @@ func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType s
 		return nil, fmt.Errorf("timeout waiting for indirect connection from %s", username)
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+// handleConnectToPeer handles the server telling us that a peer wants us to
+// connect to them (reverse/indirect connection). We dial the peer and send
+// PierceFirewall with their token, then dispatch based on connection type.
+func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
+	target := fmt.Sprintf("%s:%d", resp.IP.String(), resp.Port)
+	log.Printf("ConnectToPeer from %s type=%s addr=%s token=%d", resp.Username, resp.Type, target, resp.Token)
+
+	var d net.Dialer
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	raw, err := d.DialContext(ctx, "tcp", target)
+	if err != nil {
+		log.Printf("failed to connect to peer %s at %s: %v", resp.Username, target, err)
+		return
+	}
+
+	conn := WrapConn(raw)
+
+	// Send PierceFirewall with the token from the server message.
+	pfMsg := BuildPierceFirewall(resp.Token)
+	if err := conn.WriteMessage(pfMsg); err != nil {
+		conn.Close()
+		log.Printf("failed to send PierceFirewall to %s: %v", resp.Username, err)
+		return
+	}
+
+	pc := &PeerConn{
+		Conn:     conn,
+		Username: resp.Username,
+		Type:     resp.Type,
+		Token:    resp.Token,
+	}
+
+	switch resp.Type {
+	case ConnTypePeer:
+		if pm.onPeerConn != nil {
+			go pm.onPeerConn(pc)
+		} else {
+			conn.Close()
+		}
+	case ConnTypeTransfer:
+		if pm.onFileConn != nil {
+			go pm.onFileConn(pc)
+		} else {
+			conn.Close()
+		}
+	default:
+		conn.Close()
 	}
 }
 

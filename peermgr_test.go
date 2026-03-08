@@ -560,6 +560,135 @@ func TestPeerManager_ConnectIndirect_TokenDelivery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// handleConnectToPeer (reverse/indirect connection initiated by server)
+// ---------------------------------------------------------------------------
+
+func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	received := make(chan *PeerConn, 1)
+	pm.OnPeerConnection(func(pc *PeerConn) {
+		received <- pc
+	})
+
+	// Start a listener simulating the remote peer waiting for us.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	var peerConn net.Conn
+	accepted := make(chan struct{})
+	go func() {
+		peerConn, _ = ln.Accept()
+		close(accepted)
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+
+	// Simulate server sending us ConnectToPeer.
+	resp := &ConnectToPeerResponse{
+		Username: "remoteuser",
+		Type:     ConnTypePeer,
+		IP:       net.ParseIP("127.0.0.1"),
+		Port:     uint32(addr.Port),
+		Token:    12345,
+	}
+
+	pm.handleConnectToPeer(resp)
+
+	// Verify the peer side received a PierceFirewall message.
+	<-accepted
+	require.NotNil(t, peerConn)
+	defer peerConn.Close()
+
+	peerWrapped := WrapConn(peerConn)
+	msg, err := peerWrapped.ReadMessage()
+	require.NoError(t, err)
+
+	token, err := ParsePierceFirewall(msg)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(12345), token)
+
+	// Verify the onPeerConn callback fired.
+	select {
+	case pc := <-received:
+		assert.Equal(t, "remoteuser", pc.Username)
+		assert.Equal(t, ConnTypePeer, pc.Type)
+		assert.Equal(t, uint32(12345), pc.Token)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for peer connection callback")
+	}
+}
+
+func TestPeerManager_HandleConnectToPeer_FileType(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	received := make(chan *PeerConn, 1)
+	pm.OnFileConnection(func(pc *PeerConn) {
+		received <- pc
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := ln.Accept()
+		accepted <- c
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+
+	resp := &ConnectToPeerResponse{
+		Username: "uploader",
+		Type:     ConnTypeTransfer,
+		IP:       net.ParseIP("127.0.0.1"),
+		Port:     uint32(addr.Port),
+		Token:    99999,
+	}
+
+	pm.handleConnectToPeer(resp)
+
+	peerConn := <-accepted
+	require.NotNil(t, peerConn)
+	defer peerConn.Close()
+
+	// Verify PierceFirewall was sent.
+	peerWrapped := WrapConn(peerConn)
+	msg, err := peerWrapped.ReadMessage()
+	require.NoError(t, err)
+
+	token, err := ParsePierceFirewall(msg)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(99999), token)
+
+	select {
+	case pc := <-received:
+		assert.Equal(t, "uploader", pc.Username)
+		assert.Equal(t, ConnTypeTransfer, pc.Type)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for file connection callback")
+	}
+}
+
+func TestPeerManager_HandleConnectToPeer_UnreachablePeer(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	// Use a port that's not listening — should fail gracefully.
+	resp := &ConnectToPeerResponse{
+		Username: "ghost",
+		Type:     ConnTypePeer,
+		IP:       net.ParseIP("127.0.0.1"),
+		Port:     1, // unlikely to be open
+		Token:    55555,
+	}
+
+	// Should not panic, just log.
+	pm.handleConnectToPeer(resp)
+}
+
+// ---------------------------------------------------------------------------
 // handleIncoming with connection that closes before sending data
 // ---------------------------------------------------------------------------
 
