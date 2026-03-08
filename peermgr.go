@@ -2,6 +2,7 @@ package slsk
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -20,6 +21,16 @@ type PeerConn struct {
 // PeerHandler is called when a peer connection is fully established.
 type PeerHandler func(pc *PeerConn)
 
+// PeerMessage represents a message received on a peer connection.
+type PeerMessage struct {
+	PeerConn *PeerConn
+	Code     uint32
+	Raw      []byte // full message including length+code prefix
+}
+
+// PeerMessageHandler handles a specific peer message type.
+type PeerMessageHandler func(msg *PeerMessage)
+
 // PeerManager manages peer connections: listening for incoming,
 // establishing outgoing, and handling the init handshake.
 type PeerManager struct {
@@ -28,9 +39,10 @@ type PeerManager struct {
 	listener net.Listener
 
 	mu            sync.Mutex
-	pendingTokens map[uint32]chan *PeerConn // tokens we're waiting for (indirect)
+	pendingTokens map[uint32]chan *PeerConn              // tokens we're waiting for (indirect)
+	pendingAddrs  map[string][]chan *PeerAddressResponse // username -> waiters for address
+	msgHandlers   map[uint32]PeerMessageHandler         // message code -> handler
 
-	onPeerConn PeerHandler // called for incoming P connections
 	onFileConn PeerHandler // called for incoming F connections
 }
 
@@ -42,6 +54,8 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 		username:      username,
 		client:        client,
 		pendingTokens: make(map[uint32]chan *PeerConn),
+		pendingAddrs:  make(map[string][]chan *PeerAddressResponse),
+		msgHandlers:   make(map[uint32]PeerMessageHandler),
 	}
 
 	// Handle ConnectToPeer from server: a peer wants us to connect to them.
@@ -49,12 +63,28 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 		go pm.handleConnectToPeer(resp)
 	})
 
+	// Handle PeerAddress responses: fan out to all goroutines waiting for this peer's address.
+	client.OnPeerAddress(func(resp *PeerAddressResponse) {
+		pm.mu.Lock()
+		waiters := pm.pendingAddrs[resp.Username]
+		delete(pm.pendingAddrs, resp.Username)
+		pm.mu.Unlock()
+
+		for _, ch := range waiters {
+			ch <- resp
+		}
+	})
+
 	return pm
 }
 
-// OnPeerConnection registers handler for incoming P-type connections.
-func (pm *PeerManager) OnPeerConnection(fn PeerHandler) {
-	pm.onPeerConn = fn
+// OnPeerMessage registers a handler for a specific peer message code.
+// When a P-type connection receives a message with this code, the handler
+// is called with the message and the connection it arrived on.
+func (pm *PeerManager) OnPeerMessage(code uint32, fn PeerMessageHandler) {
+	pm.mu.Lock()
+	pm.msgHandlers[code] = fn
+	pm.mu.Unlock()
 }
 
 // OnFileConnection registers handler for incoming F-type connections.
@@ -115,6 +145,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 	if initCode == InitPierceFirewall {
 		token, err := ParsePierceFirewall(msg)
 		if err != nil {
+			log.Printf("[peermgr] incoming PierceFirewall parse error: %v", err)
 			conn.Close()
 			return
 		}
@@ -124,8 +155,10 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 		pm.mu.Unlock()
 
 		if ok {
+			log.Printf("[peermgr] incoming PierceFirewall matched token %d", token)
 			ch <- &PeerConn{Conn: conn, Token: token}
 		} else {
+			log.Printf("[peermgr] incoming PierceFirewall unmatched token %d (no pending)", token)
 			conn.Close()
 		}
 		return
@@ -147,9 +180,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 
 		switch init.Type {
 		case ConnTypePeer:
-			if pm.onPeerConn != nil {
-				go pm.onPeerConn(pc)
-			}
+			go pm.routePeerMessages(pc)
 		case ConnTypeTransfer:
 			if pm.onFileConn != nil {
 				go pm.onFileConn(pc)
@@ -166,24 +197,28 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 // ConnectToPeer establishes a peer connection, trying direct first then indirect.
 // Returns a connected PeerConn ready for message exchange.
 func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
+	log.Printf("[peermgr] ConnectToPeer %s type=%s: getting address", username, connType)
+
 	// 1. Get peer address from server.
 	addrCh := make(chan *PeerAddressResponse, 1)
 
-	// Register one-time callback.
-	pm.client.OnPeerAddress(func(resp *PeerAddressResponse) {
-		if resp.Username == username {
-			addrCh <- resp
-		}
-	})
+	// Register as a waiter for this username's address response.
+	pm.mu.Lock()
+	pm.pendingAddrs[username] = append(pm.pendingAddrs[username], addrCh)
+	needsRequest := len(pm.pendingAddrs[username]) == 1 // first waiter sends the request
+	pm.mu.Unlock()
 
-	if err := pm.client.GetPeerAddress(username); err != nil {
-		return nil, fmt.Errorf("get peer address: %w", err)
+	if needsRequest {
+		if err := pm.client.GetPeerAddress(username); err != nil {
+			return nil, fmt.Errorf("get peer address: %w", err)
+		}
 	}
 
 	// Wait for address response.
 	var addr *PeerAddressResponse
 	select {
 	case addr = <-addrCh:
+		log.Printf("[peermgr] ConnectToPeer %s: got address %s:%d", username, addr.IP, addr.Port)
 	case <-time.After(10 * time.Second):
 		return nil, fmt.Errorf("timeout waiting for peer address of %s", username)
 	case <-ctx.Done():
@@ -199,12 +234,19 @@ func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connT
 
 	pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
 	if err == nil {
+		log.Printf("[peermgr] ConnectToPeer %s: direct connection succeeded", username)
 		return pc, nil
 	}
-	log.Printf("direct connection to %s failed: %v, trying indirect", username, err)
+	log.Printf("[peermgr] ConnectToPeer %s: direct failed: %v, trying indirect", username, err)
 
 	// 3. Try indirect (NAT traversal via server).
-	return pm.connectIndirect(ctx, username, connType, token)
+	pc, err = pm.connectIndirect(ctx, username, connType, token)
+	if err != nil {
+		log.Printf("[peermgr] ConnectToPeer %s: indirect also failed: %v", username, err)
+		return nil, err
+	}
+	log.Printf("[peermgr] ConnectToPeer %s: indirect connection succeeded", username)
+	return pc, nil
 }
 
 // connectDirect dials the peer directly and sends PeerInit.
@@ -302,11 +344,7 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 
 	switch resp.Type {
 	case ConnTypePeer:
-		if pm.onPeerConn != nil {
-			go pm.onPeerConn(pc)
-		} else {
-			conn.Close()
-		}
+		go pm.routePeerMessages(pc)
 	case ConnTypeTransfer:
 		if pm.onFileConn != nil {
 			go pm.onFileConn(pc)
@@ -315,6 +353,38 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 		}
 	default:
 		conn.Close()
+	}
+}
+
+// routePeerMessages reads messages from a P-type connection and dispatches
+// them to registered handlers by message code. The connection is closed when
+// the peer disconnects or an error occurs.
+func (pm *PeerManager) routePeerMessages(pc *PeerConn) {
+	defer pc.Conn.Close()
+
+	for {
+		msg, err := pc.Conn.ReadMessage()
+		if err != nil {
+			return // connection closed
+		}
+
+		if len(msg) < 8 {
+			continue
+		}
+
+		code := binary.LittleEndian.Uint32(msg[4:8])
+
+		pm.mu.Lock()
+		handler, ok := pm.msgHandlers[code]
+		pm.mu.Unlock()
+
+		if ok {
+			handler(&PeerMessage{
+				PeerConn: pc,
+				Code:     code,
+				Raw:      msg,
+			})
+		}
 	}
 }
 

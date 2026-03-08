@@ -18,6 +18,8 @@ func newTestPeerManager(username string) *PeerManager {
 	return &PeerManager{
 		username:      username,
 		pendingTokens: make(map[uint32]chan *PeerConn),
+		pendingAddrs:  make(map[string][]chan *PeerAddressResponse),
+		msgHandlers:   make(map[uint32]PeerMessageHandler),
 	}
 }
 
@@ -58,31 +60,36 @@ func tcpPair(t *testing.T) (client net.Conn, server net.Conn) {
 func TestPeerManager_HandleIncoming_PeerInit(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	received := make(chan *PeerConn, 1)
-	pm.OnPeerConnection(func(pc *PeerConn) {
-		received <- pc
+	// Register a message handler for a test message code (code 9 = PeerSearchResponse).
+	received := make(chan *PeerMessage, 1)
+	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+		received <- msg
 	})
 
-	// Create a TCP pair: "remote" writes PeerInit, "local" is given to handleIncoming.
+	// Create a TCP pair: "remote" writes PeerInit + a peer message.
 	remote, local := tcpPair(t)
-
-	// Write a PeerInit message from the remote side.
-	initMsg := BuildPeerInit("remoteuser", ConnTypePeer, 42)
 	remoteConn := WrapConn(remote)
+
+	// Send PeerInit handshake.
+	initMsg := BuildPeerInit("remoteuser", ConnTypePeer, 42)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
-	// Feed the local side to handleIncoming.
-	pm.handleIncoming(local)
+	// Send a peer message after handshake (dummy search response-shaped message).
+	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg.WriteUint32(0) // dummy payload
+	err = remoteConn.WriteMessage(testMsg.Build())
+	require.NoError(t, err)
+
+	// Feed the local side to handleIncoming (starts routePeerMessages).
+	go pm.handleIncoming(local)
 
 	select {
-	case pc := <-received:
-		assert.Equal(t, "remoteuser", pc.Username)
-		assert.Equal(t, ConnTypePeer, pc.Type)
-		assert.Equal(t, uint32(42), pc.Token)
-		assert.NotNil(t, pc.Conn)
+	case msg := <-received:
+		assert.Equal(t, "remoteuser", msg.PeerConn.Username)
+		assert.Equal(t, PeerSearchResponse, msg.Code)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for peer connection callback")
+		t.Fatal("timed out waiting for peer message callback")
 	}
 }
 
@@ -221,9 +228,10 @@ func TestPeerManager_HandleIncoming_DistributedType_Closed(t *testing.T) {
 func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	received := make(chan *PeerConn, 1)
-	pm.OnPeerConnection(func(pc *PeerConn) {
-		received <- pc
+	// Register a message handler.
+	received := make(chan *PeerMessage, 1)
+	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+		received <- msg
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -248,7 +256,7 @@ func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 		}
 	}()
 
-	// Connect to the listener and send PeerInit.
+	// Connect to the listener and send PeerInit + a peer message.
 	raw, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	defer raw.Close()
@@ -258,13 +266,16 @@ func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 	err = conn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
+	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg.WriteUint32(0)
+	err = conn.WriteMessage(testMsg.Build())
+	require.NoError(t, err)
+
 	select {
-	case pc := <-received:
-		assert.Equal(t, "remotepeer", pc.Username)
-		assert.Equal(t, ConnTypePeer, pc.Type)
-		assert.Equal(t, uint32(1001), pc.Token)
+	case msg := <-received:
+		assert.Equal(t, "remotepeer", msg.PeerConn.Username)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for peer connection via listener")
+		t.Fatal("timed out waiting for peer message via listener")
 	}
 }
 
@@ -566,9 +577,10 @@ func TestPeerManager_ConnectIndirect_TokenDelivery(t *testing.T) {
 func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	received := make(chan *PeerConn, 1)
-	pm.OnPeerConnection(func(pc *PeerConn) {
-		received <- pc
+	// Register a message handler.
+	received := make(chan *PeerMessage, 1)
+	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+		received <- msg
 	})
 
 	// Start a listener simulating the remote peer waiting for us.
@@ -594,7 +606,7 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 		Token:    12345,
 	}
 
-	pm.handleConnectToPeer(resp)
+	go pm.handleConnectToPeer(resp)
 
 	// Verify the peer side received a PierceFirewall message.
 	<-accepted
@@ -609,14 +621,19 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(12345), token)
 
-	// Verify the onPeerConn callback fired.
+	// Send a peer message from the remote side so routePeerMessages dispatches it.
+	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg.WriteUint32(0)
+	err = peerWrapped.WriteMessage(testMsg.Build())
+	require.NoError(t, err)
+
+	// Verify the message handler fired.
 	select {
-	case pc := <-received:
-		assert.Equal(t, "remoteuser", pc.Username)
-		assert.Equal(t, ConnTypePeer, pc.Type)
-		assert.Equal(t, uint32(12345), pc.Token)
+	case m := <-received:
+		assert.Equal(t, "remoteuser", m.PeerConn.Username)
+		assert.Equal(t, PeerSearchResponse, m.Code)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for peer connection callback")
+		t.Fatal("timed out waiting for peer message callback")
 	}
 }
 
