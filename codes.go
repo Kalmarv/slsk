@@ -14,7 +14,14 @@ const (
 	ServerGetUserStats     uint32 = 36
 	ServerUserSearch       uint32 = 42
 	ServerEmbeddedMessage  uint32 = 93
+	ServerRoomList         uint32 = 64
+	ServerPrivilegedUsers  uint32 = 69
+	ServerHaveNoParent     uint32 = 71
+	ServerParentMinSpeed   uint32 = 83
+	ServerParentSpeedRatio uint32 = 84
 	ServerNetInfo          uint32 = 102
+	ServerWishlistInterval uint32 = 104
+	ServerExcludedPhrases  uint32 = 160
 	ServerWishlistSearch   uint32 = 103
 	ServerCannotConnect    uint32 = 1001
 )

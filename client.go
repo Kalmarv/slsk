@@ -111,6 +111,15 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("send SetListenPort: %w", err)
 	}
 
+	// Tell server we have no parent in the distributed search tree.
+	// This makes the server send search requests directly via EmbeddedMessage.
+	noParentMsg := BuildHaveNoParent(true)
+	if err := conn.WriteMessage(noParentMsg); err != nil {
+		c.loggedIn.Store(false)
+		conn.Close()
+		return fmt.Errorf("send HaveNoParent: %w", err)
+	}
+
 	// Start background message loop.
 	go c.messageLoop()
 
@@ -298,8 +307,13 @@ func (c *Client) messageLoop() {
 		case ServerCannotConnect:
 			// Log and ignore for now.
 
+		case ServerNetInfo, ServerRoomList, ServerPrivilegedUsers,
+			ServerParentMinSpeed, ServerParentSpeedRatio,
+			ServerWishlistInterval, ServerExcludedPhrases:
+			// Known server messages we don't need to handle.
+
 		default:
-			// Unknown code — skip silently.
+			log.Printf("slsk: unhandled server message code %d (%d bytes)", r.Code(), len(msg))
 		}
 	}
 }

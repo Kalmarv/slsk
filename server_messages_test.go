@@ -549,6 +549,8 @@ func TestParseConnectToPeerResponseTruncated(t *testing.T) {
 
 func TestParseServerSearchRequest(t *testing.T) {
 	var payload []byte
+	payload = append(payload, byte(DistribSearchRequest)) // distrib code = 3
+	payload = append(payload, u32le(49)...)                // identifier
 	payload = appendStr(payload, "searchuser")
 	payload = append(payload, u32le(99999)...) // token
 	payload = appendStr(payload, "some music query")
@@ -573,6 +575,8 @@ func TestParseServerSearchRequest(t *testing.T) {
 
 func TestParseServerSearchRequestTruncated(t *testing.T) {
 	var payload []byte
+	payload = append(payload, byte(DistribSearchRequest))
+	payload = append(payload, u32le(49)...)
 	payload = appendStr(payload, "user")
 	msg := buildMsg(ServerEmbeddedMessage, payload)
 

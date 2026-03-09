@@ -79,6 +79,9 @@ func TestClient_LoginSuccess(t *testing.T) {
 			return
 		}
 		setListenPortMsg <- msg
+
+		// Drain HaveNoParent.
+		sc.ReadMessage()
 	})
 
 	cfg := ClientConfig{
@@ -246,9 +249,8 @@ func TestClient_PingResponse(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain any messages until SetListenPort is out of the way.
-		// Then send a ping and wait for the pong.
-		// Read and discard SetListenPort.
+		// Drain SetListenPort + HaveNoParent.
+		sc.ReadMessage()
 		sc.ReadMessage()
 
 		// Send a ping to the client.
@@ -308,11 +310,14 @@ func TestClient_OnSearchRequest(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain SetListenPort.
+		// Drain SetListenPort + HaveNoParent.
+		sc.ReadMessage()
 		sc.ReadMessage()
 
 		// Send an incoming search request (code 93 = ServerEmbeddedMessage).
 		var payload []byte
+		payload = append(payload, byte(DistribSearchRequest)) // distrib code = 3
+		payload = append(payload, u32le(49)...)                // identifier
 		payload = appendStr(payload, "searchuser")
 		payload = append(payload, u32le(42)...) // token
 		payload = appendStr(payload, "pink floyd")
@@ -371,7 +376,8 @@ func TestClient_OnConnectToPeer(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain SetListenPort.
+		// Drain SetListenPort + HaveNoParent.
+		sc.ReadMessage()
 		sc.ReadMessage()
 
 		// Send a ConnectToPeer notification (code 18).

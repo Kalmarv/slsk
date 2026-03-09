@@ -249,6 +249,48 @@ func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connT
 	return pc, nil
 }
 
+// ConnectToPeerWithToken is like ConnectToPeer but uses the specified token
+// instead of generating a random one. Used for F-connections where the token
+// must match the transfer token.
+func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username string, connType string, token uint32) (*PeerConn, error) {
+	log.Printf("[peermgr] ConnectToPeerWithToken %s type=%s token=%d: getting address", username, connType, token)
+
+	addrCh := make(chan *PeerAddressResponse, 1)
+	pm.mu.Lock()
+	pm.pendingAddrs[username] = append(pm.pendingAddrs[username], addrCh)
+	needsRequest := len(pm.pendingAddrs[username]) == 1
+	pm.mu.Unlock()
+
+	if needsRequest {
+		if err := pm.client.GetPeerAddress(username); err != nil {
+			return nil, fmt.Errorf("get peer address: %w", err)
+		}
+	}
+
+	var addr *PeerAddressResponse
+	select {
+	case addr = <-addrCh:
+	case <-time.After(10 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for peer address of %s", username)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer directCancel()
+
+	pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
+	if err == nil {
+		return pc, nil
+	}
+
+	pc, err = pm.connectIndirect(ctx, username, connType, token)
+	if err != nil {
+		return nil, err
+	}
+	return pc, nil
+}
+
 // connectDirect dials the peer directly and sends PeerInit.
 func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
 	target := fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
@@ -384,6 +426,8 @@ func (pm *PeerManager) routePeerMessages(pc *PeerConn) {
 				Code:     code,
 				Raw:      msg,
 			})
+		} else {
+			log.Printf("[peermgr] unhandled peer message code %d from %s (%d bytes)", code, pc.Username, len(msg))
 		}
 	}
 }

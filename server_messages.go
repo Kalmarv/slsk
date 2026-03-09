@@ -148,6 +148,15 @@ func BuildSharedFoldersFiles(dirs, files uint32) []byte {
 	return b.Build()
 }
 
+// BuildHaveNoParent builds a HaveNoParent message (code 71).
+// Tells the server this client has no parent in the distributed search tree.
+// The server will then send search requests directly via EmbeddedMessage (code 93).
+func BuildHaveNoParent(noParent bool) []byte {
+	b := NewBuilder(ServerHaveNoParent)
+	b.WriteBool(noParent)
+	return b.Build()
+}
+
 // BuildPing builds a ping message (code 32) with no payload.
 func BuildPing() []byte {
 	b := NewBuilder(ServerPing)
@@ -389,11 +398,30 @@ func ParseConnectToPeerResponse(msg []byte) (*ConnectToPeerResponse, error) {
 }
 
 // ParseServerSearchRequest parses an incoming distributed search request
-// from the server (code 93). Fields: username, token, query.
+// from the server (code 93 = EmbeddedMessage).
+// Wire format: [server header][uint8 distrib_code=3][uint32 identifier=49][string username][uint32 token][string query]
 func ParseServerSearchRequest(msg []byte) (*IncomingSearchRequest, error) {
 	r, err := NewReader(msg)
 	if err != nil {
 		return nil, fmt.Errorf("parse server search: %w", err)
+	}
+
+	// Read and validate the distributed message code (should be 3 = DistribSearchRequest).
+	distribCode, err := r.ReadUint8()
+	if err != nil {
+		return nil, fmt.Errorf("parse server search: read distrib code: %w", err)
+	}
+	if distribCode != DistribSearchRequest {
+		return nil, fmt.Errorf("parse server search: unexpected distrib code %d, want %d", distribCode, DistribSearchRequest)
+	}
+
+	// Read and validate the identifier (should be 49).
+	identifier, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse server search: read identifier: %w", err)
+	}
+	if identifier != distribSearchIdentifier {
+		return nil, fmt.Errorf("parse server search: unexpected identifier %d, want %d", identifier, distribSearchIdentifier)
 	}
 
 	username, err := r.ReadString()
