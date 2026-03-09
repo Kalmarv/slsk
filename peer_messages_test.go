@@ -560,3 +560,104 @@ func TestTransferRequestLargeFileSize(t *testing.T) {
 		t.Fatalf("fileSize = %#x, want 0xABCDEF0123456789", parsed.FileSize)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ParseQueueDownload tests
+// ---------------------------------------------------------------------------
+
+func TestParseQueueDownload(t *testing.T) {
+	// Wire: [len][code=43][filename: string]
+	var payload []byte
+	payload = appendStr(payload, `Music\Artist\Album\01 Track.flac`)
+	msg := buildMsg(43, payload)
+
+	filename, err := ParseQueueDownload(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filename != `Music\Artist\Album\01 Track.flac` {
+		t.Errorf("filename = %q, want %q", filename, `Music\Artist\Album\01 Track.flac`)
+	}
+}
+
+func TestParseQueueDownloadEmpty(t *testing.T) {
+	var payload []byte
+	payload = appendStr(payload, "")
+	msg := buildMsg(43, payload)
+
+	_, err := ParseQueueDownload(msg)
+	if err != nil {
+		t.Fatalf("unexpected error for empty filename: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ParseTransferResponse tests
+// ---------------------------------------------------------------------------
+
+func TestParseTransferResponseAllowed(t *testing.T) {
+	// Wire: [len][code=41][token: u32][allowed: bool=1]
+	var payload []byte
+	payload = append(payload, u32le(12345)...)
+	payload = append(payload, 1) // allowed=true
+	msg := buildMsg(41, payload)
+
+	resp, err := ParseTransferResponse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Token != 12345 || !resp.Allowed {
+		t.Errorf("got token=%d allowed=%v, want 12345/true", resp.Token, resp.Allowed)
+	}
+}
+
+func TestParseTransferResponseDenied(t *testing.T) {
+	// Wire: [len][code=41][token: u32][allowed: bool=0][reason: string]
+	var payload []byte
+	payload = append(payload, u32le(99999)...)
+	payload = append(payload, 0) // allowed=false
+	payload = appendStr(payload, "Queued")
+	msg := buildMsg(41, payload)
+
+	resp, err := ParseTransferResponse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Token != 99999 || resp.Allowed || resp.Reason != "Queued" {
+		t.Errorf("got token=%d allowed=%v reason=%q", resp.Token, resp.Allowed, resp.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BuildPlaceInQueueResponse tests
+// ---------------------------------------------------------------------------
+
+func TestBuildPlaceInQueueResponse(t *testing.T) {
+	msg := BuildPlaceInQueueResponse(`Music\file.flac`, 5)
+	parsed, err := ParsePlaceInQueueResponse(msg)
+	if err != nil {
+		t.Fatalf("round-trip failed: %v", err)
+	}
+	if parsed.Filename != `Music\file.flac` || parsed.Place != 5 {
+		t.Errorf("got filename=%q place=%d", parsed.Filename, parsed.Place)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ParsePlaceInQueueRequest tests
+// ---------------------------------------------------------------------------
+
+func TestParsePlaceInQueueRequest(t *testing.T) {
+	// Wire: [len][code=51][filename: string]
+	var payload []byte
+	payload = appendStr(payload, `Music\Artist\track.mp3`)
+	msg := buildMsg(51, payload)
+
+	filename, err := ParsePlaceInQueueRequest(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filename != `Music\Artist\track.mp3` {
+		t.Errorf("filename = %q", filename)
+	}
+}

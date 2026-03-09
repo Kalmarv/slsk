@@ -44,6 +44,13 @@ type TransferRequest struct {
 	FileSize  uint64
 }
 
+// TransferResponse is a parsed transfer response (code 41).
+type TransferResponse struct {
+	Token   uint32
+	Allowed bool
+	Reason  string // only populated when Allowed=false
+}
+
 // PlaceInQueue is the response to a place-in-queue request (code 44).
 type PlaceInQueue struct {
 	Filename string
@@ -318,6 +325,33 @@ func BuildTransferResponseDenied(token uint32, reason string) []byte {
 	return b.Build()
 }
 
+// ParseTransferResponse parses a transfer response (code 41).
+func ParseTransferResponse(msg []byte) (*TransferResponse, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return nil, fmt.Errorf("transfer response: %w", err)
+	}
+	if r.Code() != PeerTransferResponse {
+		return nil, fmt.Errorf("expected code %d, got %d", PeerTransferResponse, r.Code())
+	}
+	resp := &TransferResponse{}
+	resp.Token, err = r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("transfer response token: %w", err)
+	}
+	resp.Allowed, err = r.ReadBool()
+	if err != nil {
+		return nil, fmt.Errorf("transfer response allowed: %w", err)
+	}
+	if !resp.Allowed && r.HasMore() {
+		resp.Reason, err = r.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("transfer response reason: %w", err)
+		}
+	}
+	return resp, nil
+}
+
 // ---------------------------------------------------------------------------
 // Queue Download (code 43)
 // ---------------------------------------------------------------------------
@@ -327,6 +361,23 @@ func BuildQueueDownload(filename string) []byte {
 	b := NewBuilder(PeerQueueDownload)
 	b.WriteString(filename)
 	return b.Build()
+}
+
+// ParseQueueDownload parses a QueueDownload message (code 43).
+// Returns the requested filename.
+func ParseQueueDownload(msg []byte) (string, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return "", fmt.Errorf("queue download: %w", err)
+	}
+	if r.Code() != PeerQueueDownload {
+		return "", fmt.Errorf("expected code %d, got %d", PeerQueueDownload, r.Code())
+	}
+	filename, err := r.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("queue download filename: %w", err)
+	}
+	return filename, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +391,34 @@ func BuildPlaceInQueueRequest(filename string) []byte {
 	return b.Build()
 }
 
+// ParsePlaceInQueueRequest parses a PlaceInQueueRequest message (code 51).
+// Returns the requested filename.
+func ParsePlaceInQueueRequest(msg []byte) (string, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return "", fmt.Errorf("place in queue request: %w", err)
+	}
+	if r.Code() != PeerPlaceInQueueRequest {
+		return "", fmt.Errorf("expected code %d, got %d", PeerPlaceInQueueRequest, r.Code())
+	}
+	filename, err := r.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("place in queue request filename: %w", err)
+	}
+	return filename, nil
+}
+
 // ---------------------------------------------------------------------------
 // Place In Queue Response (code 44)
 // ---------------------------------------------------------------------------
+
+// BuildPlaceInQueueResponse builds a PlaceInQueueResponse message (code 44).
+func BuildPlaceInQueueResponse(filename string, place uint32) []byte {
+	b := NewBuilder(PeerPlaceInQueueResponse)
+	b.WriteString(filename)
+	b.WriteUint32(place)
+	return b.Build()
+}
 
 // ParsePlaceInQueueResponse parses a place-in-queue response (code 44).
 func ParsePlaceInQueueResponse(msg []byte) (*PlaceInQueue, error) {
