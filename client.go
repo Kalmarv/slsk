@@ -272,6 +272,19 @@ func (c *Client) messageLoop() {
 				c.onPeerAddress(resp)
 			}
 
+		case ServerWatchUser:
+			resp, err := ParseWatchUserResponse(msg)
+			if err != nil {
+				log.Printf("slsk: failed to parse watch user response: %v", err)
+				continue
+			}
+			if resp.Exists && c.onUserStatus != nil {
+				c.onUserStatus(&UserStatusResponse{
+					Username: resp.Username,
+					Status:   resp.Status,
+				})
+			}
+
 		case ServerGetStatus:
 			resp, err := ParseGetUserStatusResponse(msg)
 			if err != nil {
