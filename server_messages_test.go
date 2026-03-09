@@ -738,3 +738,106 @@ func TestIPReversalMaxValues(t *testing.T) {
 		t.Fatalf("IP = %v, want %v", resp.IP, expectedIP)
 	}
 }
+
+// ---------- BuildWatchUserRequest ----------
+
+func TestBuildWatchUserRequest(t *testing.T) {
+	msg := BuildWatchUserRequest("cooluser")
+
+	r, err := NewReader(msg)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	if r.Code() != ServerWatchUser {
+		t.Fatalf("code = %d, want %d", r.Code(), ServerWatchUser)
+	}
+
+	u, err := r.ReadString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "cooluser" {
+		t.Fatalf("username = %q, want cooluser", u)
+	}
+
+	if r.HasMore() {
+		t.Fatal("unexpected trailing data")
+	}
+}
+
+// ---------- ParseWatchUserResponse ----------
+
+func TestParseWatchUserResponseExists(t *testing.T) {
+	// Existing user: exists=true, username, status=2, avgspeed=56000, uploadnum=150, files=1200, dirs=45
+	var payload []byte
+	payload = append(payload, 1) // exists = true
+	payload = appendStr(payload, "cooluser")
+	payload = append(payload, u32le(2)...)     // status = online
+	payload = append(payload, u32le(56000)...) // avgspeed
+	payload = append(payload, u64le(150)...)   // uploadnum
+	payload = append(payload, u32le(1200)...)  // files
+	payload = append(payload, u32le(45)...)    // dirs
+
+	msg := buildMsg(ServerWatchUser, payload)
+
+	resp, err := ParseWatchUserResponse(msg)
+	if err != nil {
+		t.Fatalf("ParseWatchUserResponse: %v", err)
+	}
+
+	if !resp.Exists {
+		t.Fatal("expected exists=true")
+	}
+	if resp.Username != "cooluser" {
+		t.Fatalf("username = %q, want cooluser", resp.Username)
+	}
+	if resp.Status != 2 {
+		t.Fatalf("status = %d, want 2", resp.Status)
+	}
+	if resp.AvgSpeed != 56000 {
+		t.Fatalf("avgspeed = %d, want 56000", resp.AvgSpeed)
+	}
+	if resp.UploadNum != 150 {
+		t.Fatalf("uploadnum = %d, want 150", resp.UploadNum)
+	}
+	if resp.Files != 1200 {
+		t.Fatalf("files = %d, want 1200", resp.Files)
+	}
+	if resp.Dirs != 45 {
+		t.Fatalf("dirs = %d, want 45", resp.Dirs)
+	}
+}
+
+func TestParseWatchUserResponseNotExists(t *testing.T) {
+	// Non-existing user: exists=false, no further fields
+	var payload []byte
+	payload = append(payload, 0) // exists = false
+
+	msg := buildMsg(ServerWatchUser, payload)
+
+	resp, err := ParseWatchUserResponse(msg)
+	if err != nil {
+		t.Fatalf("ParseWatchUserResponse: %v", err)
+	}
+
+	if resp.Exists {
+		t.Fatal("expected exists=false")
+	}
+	if resp.Username != "" {
+		t.Fatalf("username should be empty, got %q", resp.Username)
+	}
+}
+
+func TestParseWatchUserResponseTruncated(t *testing.T) {
+	// exists=true but no further data — should return error
+	var payload []byte
+	payload = append(payload, 1) // exists = true
+
+	msg := buildMsg(ServerWatchUser, payload)
+
+	_, err := ParseWatchUserResponse(msg)
+	if err == nil {
+		t.Fatal("expected error for truncated response")
+	}
+}

@@ -45,6 +45,20 @@ type UserStatusResponse struct {
 	Privileged bool
 }
 
+// WatchUserResponse is the parsed response to a WatchUser request (code 5).
+// If Exists is false, only that field is populated. If Exists is true, all
+// remaining fields are present: Username, Status (0=offline, 1=away, 2=online),
+// AvgSpeed, UploadNum, Files, Dirs.
+type WatchUserResponse struct {
+	Exists    bool
+	Username  string
+	Status    uint32
+	AvgSpeed  uint32
+	UploadNum uint64
+	Files     uint32
+	Dirs      uint32
+}
+
 // IncomingSearchRequest is a search request distributed by the server (code 93).
 type IncomingSearchRequest struct {
 	Username string
@@ -97,6 +111,14 @@ func BuildFileSearchRequest(token uint32, query string) []byte {
 // Fields: username.
 func BuildGetPeerAddressRequest(username string) []byte {
 	b := NewBuilder(ServerGetPeerAddress)
+	b.WriteString(username)
+	return b.Build()
+}
+
+// BuildWatchUserRequest builds a WatchUser request (code 5).
+// Fields: username.
+func BuildWatchUserRequest(username string) []byte {
+	b := NewBuilder(ServerWatchUser)
 	b.WriteString(username)
 	return b.Build()
 }
@@ -257,6 +279,65 @@ func ParseGetUserStatusResponse(msg []byte) (*UserStatusResponse, error) {
 		Status:     status,
 		Privileged: privileged,
 	}, nil
+}
+
+// ParseWatchUserResponse parses a WatchUser response (code 5).
+// If exists=false, returns early with just Exists=false.
+// If exists=true, reads: username, status, avgspeed, uploadnum, files, dirs.
+func ParseWatchUserResponse(msg []byte) (*WatchUserResponse, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: %w", err)
+	}
+
+	exists, err := r.ReadBool()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read exists: %w", err)
+	}
+
+	resp := &WatchUserResponse{Exists: exists}
+
+	if !exists {
+		return resp, nil
+	}
+
+	username, err := r.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read username: %w", err)
+	}
+	resp.Username = username
+
+	status, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read status: %w", err)
+	}
+	resp.Status = status
+
+	avgSpeed, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read avgspeed: %w", err)
+	}
+	resp.AvgSpeed = avgSpeed
+
+	uploadNum, err := r.ReadUint64()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read uploadnum: %w", err)
+	}
+	resp.UploadNum = uploadNum
+
+	files, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read files: %w", err)
+	}
+	resp.Files = files
+
+	dirs, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read dirs: %w", err)
+	}
+	resp.Dirs = dirs
+
+	return resp, nil
 }
 
 // ParseConnectToPeerResponse parses a ConnectToPeer response (code 18).
