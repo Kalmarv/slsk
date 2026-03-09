@@ -582,6 +582,119 @@ func TestParseServerSearchRequestTruncated(t *testing.T) {
 	}
 }
 
+// ---------- BuildGetUserStatusRequest ----------
+
+func TestBuildGetUserStatusRequest(t *testing.T) {
+	msg := BuildGetUserStatusRequest("someuser")
+
+	r, err := NewReader(msg)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+
+	if r.Code() != ServerGetStatus {
+		t.Fatalf("code = %d, want %d", r.Code(), ServerGetStatus)
+	}
+
+	u, err := r.ReadString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != "someuser" {
+		t.Fatalf("username = %q, want someuser", u)
+	}
+
+	if r.HasMore() {
+		t.Fatal("unexpected trailing data")
+	}
+}
+
+// ---------- ParseGetUserStatusResponse ----------
+
+func TestParseGetUserStatusResponse(t *testing.T) {
+	// Online user (status=2, privileged=true)
+	var payload []byte
+	payload = appendStr(payload, "onlineuser")
+	payload = append(payload, u32le(2)...) // status = online
+	payload = append(payload, 1)           // privileged = true
+
+	msg := buildMsg(ServerGetStatus, payload)
+
+	resp, err := ParseGetUserStatusResponse(msg)
+	if err != nil {
+		t.Fatalf("ParseGetUserStatusResponse: %v", err)
+	}
+
+	if resp.Username != "onlineuser" {
+		t.Fatalf("username = %q, want onlineuser", resp.Username)
+	}
+	if resp.Status != 2 {
+		t.Fatalf("status = %d, want 2", resp.Status)
+	}
+	if !resp.Privileged {
+		t.Fatal("expected privileged=true")
+	}
+}
+
+func TestParseGetUserStatusResponseOffline(t *testing.T) {
+	// Offline user (status=0, privileged=false)
+	var payload []byte
+	payload = appendStr(payload, "offlineuser")
+	payload = append(payload, u32le(0)...) // status = offline
+	payload = append(payload, 0)           // privileged = false
+
+	msg := buildMsg(ServerGetStatus, payload)
+
+	resp, err := ParseGetUserStatusResponse(msg)
+	if err != nil {
+		t.Fatalf("ParseGetUserStatusResponse: %v", err)
+	}
+
+	if resp.Username != "offlineuser" {
+		t.Fatalf("username = %q, want offlineuser", resp.Username)
+	}
+	if resp.Status != 0 {
+		t.Fatalf("status = %d, want 0", resp.Status)
+	}
+	if resp.Privileged {
+		t.Fatal("expected privileged=false")
+	}
+}
+
+func TestParseGetUserStatusResponseAway(t *testing.T) {
+	// Away user (status=1)
+	var payload []byte
+	payload = appendStr(payload, "awayuser")
+	payload = append(payload, u32le(1)...) // status = away
+	payload = append(payload, 0)           // privileged = false
+
+	msg := buildMsg(ServerGetStatus, payload)
+
+	resp, err := ParseGetUserStatusResponse(msg)
+	if err != nil {
+		t.Fatalf("ParseGetUserStatusResponse: %v", err)
+	}
+
+	if resp.Username != "awayuser" {
+		t.Fatalf("username = %q, want awayuser", resp.Username)
+	}
+	if resp.Status != 1 {
+		t.Fatalf("status = %d, want 1", resp.Status)
+	}
+}
+
+func TestParseGetUserStatusResponseTruncated(t *testing.T) {
+	// Only username, no status or privileged
+	var payload []byte
+	payload = appendStr(payload, "user")
+	msg := buildMsg(ServerGetStatus, payload)
+
+	_, err := ParseGetUserStatusResponse(msg)
+	if err == nil {
+		t.Fatal("expected error for truncated response")
+	}
+}
+
 // ---------- IP reversal edge cases ----------
 
 func TestIPReversalAllZeroes(t *testing.T) {

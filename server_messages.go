@@ -37,6 +37,14 @@ type ConnectToPeerResponse struct {
 	Privileged bool
 }
 
+// UserStatusResponse is the parsed response to a GetUserStatus request (code 7).
+// Status values: 0=offline, 1=away, 2=online.
+type UserStatusResponse struct {
+	Username   string
+	Status     uint32
+	Privileged bool
+}
+
 // IncomingSearchRequest is a search request distributed by the server (code 93).
 type IncomingSearchRequest struct {
 	Username string
@@ -89,6 +97,14 @@ func BuildFileSearchRequest(token uint32, query string) []byte {
 // Fields: username.
 func BuildGetPeerAddressRequest(username string) []byte {
 	b := NewBuilder(ServerGetPeerAddress)
+	b.WriteString(username)
+	return b.Build()
+}
+
+// BuildGetUserStatusRequest builds a GetUserStatus request (code 7).
+// Fields: username.
+func BuildGetUserStatusRequest(username string) []byte {
+	b := NewBuilder(ServerGetStatus)
 	b.WriteString(username)
 	return b.Build()
 }
@@ -210,6 +226,36 @@ func ParseGetPeerAddressResponse(msg []byte) (*PeerAddressResponse, error) {
 		Username: username,
 		IP:       ip,
 		Port:     port,
+	}, nil
+}
+
+// ParseGetUserStatusResponse parses a GetUserStatus response (code 7).
+// Fields: username, status (uint32), privileged (bool).
+func ParseGetUserStatusResponse(msg []byte) (*UserStatusResponse, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parse user status: %w", err)
+	}
+
+	username, err := r.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("parse user status: read username: %w", err)
+	}
+
+	status, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse user status: read status: %w", err)
+	}
+
+	privileged, err := r.ReadBool()
+	if err != nil {
+		return nil, fmt.Errorf("parse user status: read privileged: %w", err)
+	}
+
+	return &UserStatusResponse{
+		Username:   username,
+		Status:     status,
+		Privileged: privileged,
 	}, nil
 }
 
