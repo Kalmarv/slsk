@@ -769,10 +769,10 @@ func TestBuildWatchUserRequest(t *testing.T) {
 // ---------- ParseWatchUserResponse ----------
 
 func TestParseWatchUserResponseExists(t *testing.T) {
-	// Existing user: exists=true, username, status=2, avgspeed=56000, uploadnum=150, files=1200, dirs=45
+	// Existing user: username, exists=true, status=2, avgspeed=56000, uploadnum=150, files=1200, dirs=45
 	var payload []byte
-	payload = append(payload, 1) // exists = true
 	payload = appendStr(payload, "cooluser")
+	payload = append(payload, 1)               // exists = true
 	payload = append(payload, u32le(2)...)     // status = online
 	payload = append(payload, u32le(56000)...) // avgspeed
 	payload = append(payload, u64le(150)...)   // uploadnum
@@ -810,8 +810,9 @@ func TestParseWatchUserResponseExists(t *testing.T) {
 }
 
 func TestParseWatchUserResponseNotExists(t *testing.T) {
-	// Non-existing user: exists=false, no further fields
+	// Non-existing user: username, exists=false, no further fields
 	var payload []byte
+	payload = appendStr(payload, "ghostuser")
 	payload = append(payload, 0) // exists = false
 
 	msg := buildMsg(ServerWatchUser, payload)
@@ -824,14 +825,15 @@ func TestParseWatchUserResponseNotExists(t *testing.T) {
 	if resp.Exists {
 		t.Fatal("expected exists=false")
 	}
-	if resp.Username != "" {
-		t.Fatalf("username should be empty, got %q", resp.Username)
+	if resp.Username != "ghostuser" {
+		t.Fatalf("username = %q, want ghostuser", resp.Username)
 	}
 }
 
 func TestParseWatchUserResponseTruncated(t *testing.T) {
-	// exists=true but no further data — should return error
+	// username + exists=true but no further data — should return error
 	var payload []byte
+	payload = appendStr(payload, "user")
 	payload = append(payload, 1) // exists = true
 
 	msg := buildMsg(ServerWatchUser, payload)

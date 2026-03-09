@@ -290,22 +290,22 @@ func ParseWatchUserResponse(msg []byte) (*WatchUserResponse, error) {
 		return nil, fmt.Errorf("parse watch user: %w", err)
 	}
 
+	// Server echoes username first, then exists flag.
+	username, err := r.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("parse watch user: read username: %w", err)
+	}
+
 	exists, err := r.ReadBool()
 	if err != nil {
 		return nil, fmt.Errorf("parse watch user: read exists: %w", err)
 	}
 
-	resp := &WatchUserResponse{Exists: exists}
+	resp := &WatchUserResponse{Username: username, Exists: exists}
 
 	if !exists {
 		return resp, nil
 	}
-
-	username, err := r.ReadString()
-	if err != nil {
-		return nil, fmt.Errorf("parse watch user: read username: %w", err)
-	}
-	resp.Username = username
 
 	status, err := r.ReadUint32()
 	if err != nil {
