@@ -32,6 +32,7 @@ type Client struct {
 	onSearchRequest func(*IncomingSearchRequest)
 	onConnectToPeer func(*ConnectToPeerResponse)
 	onPeerAddress   func(*PeerAddressResponse)
+	onUserStatus    func(*UserStatusResponse)
 }
 
 // NewClient creates a new Client with the given configuration, applying
@@ -190,6 +191,31 @@ func (c *Client) OnPeerAddress(fn func(*PeerAddressResponse)) {
 	c.onPeerAddress = fn
 }
 
+// GetUserStatus sends a GetUserStatus request (code 7) for the given username.
+func (c *Client) GetUserStatus(username string) error {
+	if !c.loggedIn.Load() {
+		return errors.New("not logged in")
+	}
+	msg := BuildGetUserStatusRequest(username)
+	return c.conn.WriteMessage(msg)
+}
+
+// WatchUser sends a WatchUser request (code 5) for the given username.
+func (c *Client) WatchUser(username string) error {
+	if !c.loggedIn.Load() {
+		return errors.New("not logged in")
+	}
+	msg := BuildWatchUserRequest(username)
+	return c.conn.WriteMessage(msg)
+}
+
+// OnUserStatus registers a callback for GetUserStatus responses (code 7).
+// This fires both for explicit GetUserStatus requests and for server-pushed
+// status changes after WatchUser subscriptions.
+func (c *Client) OnUserStatus(fn func(*UserStatusResponse)) {
+	c.onUserStatus = fn
+}
+
 // messageLoop reads messages from the server in a loop and dispatches
 // them by code. It runs in a goroutine and exits on read error.
 func (c *Client) messageLoop() {
@@ -244,6 +270,16 @@ func (c *Client) messageLoop() {
 			}
 			if c.onPeerAddress != nil {
 				c.onPeerAddress(resp)
+			}
+
+		case ServerGetStatus:
+			resp, err := ParseGetUserStatusResponse(msg)
+			if err != nil {
+				log.Printf("slsk: failed to parse user status: %v", err)
+				continue
+			}
+			if c.onUserStatus != nil {
+				c.onUserStatus(resp)
 			}
 
 		case ServerCannotConnect:
