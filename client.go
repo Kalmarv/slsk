@@ -29,10 +29,13 @@ type Client struct {
 	mu       sync.Mutex // protects conn field
 
 	// Event callbacks
-	onSearchRequest func(*IncomingSearchRequest)
-	onConnectToPeer func(*ConnectToPeerResponse)
-	onPeerAddress   func(*PeerAddressResponse)
-	onUserStatus    func(*UserStatusResponse)
+	onSearchRequest  func(*IncomingSearchRequest)
+	onConnectToPeer  func(*ConnectToPeerResponse)
+	onPeerAddress    func(*PeerAddressResponse)
+	onUserStatus     func(*UserStatusResponse)
+	onCannotConnect  func(token uint32)
+
+	distribMgr *DistribManager
 }
 
 // NewClient creates a new Client with the given configuration, applying
@@ -103,21 +106,25 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.loggedIn.Store(true)
 
-	// Send SetListenPort.
-	portMsg := BuildSetListenPort(c.cfg.ListenPort)
-	if err := conn.WriteMessage(portMsg); err != nil {
-		c.loggedIn.Store(false)
-		conn.Close()
-		return fmt.Errorf("send SetListenPort: %w", err)
+	// Post-login initialization: matches soul/Nicotine+ sequence.
+	initMsgs := []struct {
+		name string
+		data []byte
+	}{
+		{"CheckPrivileges", BuildCheckPrivileges()},
+		{"SetListenPort", BuildSetListenPort(c.cfg.ListenPort)},
+		{"SetStatus", BuildSetStatus(2)},
+		{"HaveNoParent", BuildHaveNoParent(true)},
+		{"BranchRoot", BuildBranchRoot(c.cfg.Username)},
+		{"BranchLevel", BuildBranchLevel(0)},
+		{"AcceptChildren", BuildAcceptChildren(true)},
 	}
-
-	// Tell server we have no parent in the distributed search tree.
-	// This makes the server send search requests directly via EmbeddedMessage.
-	noParentMsg := BuildHaveNoParent(true)
-	if err := conn.WriteMessage(noParentMsg); err != nil {
-		c.loggedIn.Store(false)
-		conn.Close()
-		return fmt.Errorf("send HaveNoParent: %w", err)
+	for _, m := range initMsgs {
+		if err := conn.WriteMessage(m.data); err != nil {
+			c.loggedIn.Store(false)
+			conn.Close()
+			return fmt.Errorf("send %s: %w", m.name, err)
+		}
 	}
 
 	// Start background message loop.
@@ -225,6 +232,37 @@ func (c *Client) OnUserStatus(fn func(*UserStatusResponse)) {
 	c.onUserStatus = fn
 }
 
+// OnCannotConnect registers a callback for CannotConnect (code 1001).
+// The server sends this when a peer we asked to connect to us cannot reach us,
+// carrying the token from our original ConnectToPeer request.
+func (c *Client) OnCannotConnect(fn func(token uint32)) {
+	c.onCannotConnect = fn
+}
+
+// SetDistribManager sets the distributed network manager. When set, the client
+// will parse NetInfo (code 102) messages and pass them to the manager. The manager's
+// OnParentChange callback is wired to send HaveNoParent/BranchLevel/BranchRoot
+// updates back to the server.
+func (c *Client) SetDistribManager(dm *DistribManager) {
+	c.distribMgr = dm
+	dm.OnParentChange = func(hasParent bool, branchLevel uint32, branchRoot string) {
+		if !c.loggedIn.Load() {
+			return
+		}
+		// Tell server whether we have a parent.
+		if err := c.conn.WriteMessage(BuildHaveNoParent(!hasParent)); err != nil {
+			log.Printf("slsk: send HaveNoParent: %v", err)
+		}
+		if err := c.conn.WriteMessage(BuildBranchLevel(branchLevel)); err != nil {
+			log.Printf("slsk: send BranchLevel: %v", err)
+		}
+		if err := c.conn.WriteMessage(BuildBranchRoot(branchRoot)); err != nil {
+			log.Printf("slsk: send BranchRoot: %v", err)
+		}
+		log.Printf("slsk: distrib state update: hasParent=%v level=%d root=%s", hasParent, branchLevel, branchRoot)
+	}
+}
+
 // messageLoop reads messages from the server in a loop and dispatches
 // them by code. It runs in a goroutine and exits on read error.
 func (c *Client) messageLoop() {
@@ -252,6 +290,7 @@ func (c *Client) messageLoop() {
 
 		case ServerEmbeddedMessage:
 			// Incoming search request (code 93).
+			log.Printf("slsk: received EmbeddedMessage (%d bytes)", len(msg))
 			req, err := ParseServerSearchRequest(msg)
 			if err != nil {
 				log.Printf("slsk: failed to parse search request: %v", err)
@@ -305,9 +344,28 @@ func (c *Client) messageLoop() {
 			}
 
 		case ServerCannotConnect:
-			// Log and ignore for now.
+			token, err := ParseCannotConnect(msg)
+			if err != nil {
+				log.Printf("slsk: failed to parse CannotConnect: %v", err)
+				continue
+			}
+			log.Printf("slsk: CannotConnect token=%d", token)
+			if c.onCannotConnect != nil {
+				c.onCannotConnect(token)
+			}
 
-		case ServerNetInfo, ServerRoomList, ServerPrivilegedUsers,
+		case ServerNetInfo:
+			parents, err := ParseNetInfo(msg)
+			if err != nil {
+				log.Printf("slsk: failed to parse net info: %v", err)
+				continue
+			}
+			if c.distribMgr != nil && len(parents) > 0 {
+				log.Printf("slsk: received %d potential parents", len(parents))
+				c.distribMgr.HandleNetInfo(parents)
+			}
+
+		case ServerCheckPrivileges, ServerRoomList, ServerPrivilegedUsers,
 			ServerParentMinSpeed, ServerParentSpeedRatio,
 			ServerWishlistInterval, ServerExcludedPhrases:
 			// Known server messages we don't need to handle.

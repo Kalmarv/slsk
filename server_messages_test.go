@@ -847,3 +847,127 @@ func TestParseWatchUserResponseTruncated(t *testing.T) {
 		t.Fatal("expected error for truncated response")
 	}
 }
+
+// ---------- ParseNetInfo (code 102) ----------
+
+func TestParseNetInfoSingleParent(t *testing.T) {
+	var payload []byte
+	payload = append(payload, u32le(1)...) // 1 parent
+	payload = appendStr(payload, "parentuser")
+	payload = append(payload, reversedIP(192, 168, 1, 100)...)
+	payload = append(payload, u32le(2235)...) // port
+
+	msg := buildMsg(ServerNetInfo, payload)
+
+	parents, err := ParseNetInfo(msg)
+	if err != nil {
+		t.Fatalf("ParseNetInfo: %v", err)
+	}
+
+	if len(parents) != 1 {
+		t.Fatalf("got %d parents, want 1", len(parents))
+	}
+	if parents[0].Username != "parentuser" {
+		t.Fatalf("username = %q, want parentuser", parents[0].Username)
+	}
+	expectedIP := net.IPv4(192, 168, 1, 100).To4()
+	if !parents[0].IP.Equal(expectedIP) {
+		t.Fatalf("IP = %v, want %v", parents[0].IP, expectedIP)
+	}
+	if parents[0].Port != 2235 {
+		t.Fatalf("port = %d, want 2235", parents[0].Port)
+	}
+}
+
+func TestParseNetInfoMultipleParents(t *testing.T) {
+	var payload []byte
+	payload = append(payload, u32le(3)...) // 3 parents
+
+	payload = appendStr(payload, "alice")
+	payload = append(payload, reversedIP(10, 0, 0, 1)...)
+	payload = append(payload, u32le(2235)...)
+
+	payload = appendStr(payload, "bob")
+	payload = append(payload, reversedIP(10, 0, 0, 2)...)
+	payload = append(payload, u32le(3000)...)
+
+	payload = appendStr(payload, "charlie")
+	payload = append(payload, reversedIP(10, 0, 0, 3)...)
+	payload = append(payload, u32le(4000)...)
+
+	msg := buildMsg(ServerNetInfo, payload)
+
+	parents, err := ParseNetInfo(msg)
+	if err != nil {
+		t.Fatalf("ParseNetInfo: %v", err)
+	}
+
+	if len(parents) != 3 {
+		t.Fatalf("got %d parents, want 3", len(parents))
+	}
+
+	if parents[1].Username != "bob" {
+		t.Fatalf("parents[1].username = %q, want bob", parents[1].Username)
+	}
+	if parents[1].Port != 3000 {
+		t.Fatalf("parents[1].port = %d, want 3000", parents[1].Port)
+	}
+	if parents[2].Username != "charlie" {
+		t.Fatalf("parents[2].username = %q, want charlie", parents[2].Username)
+	}
+}
+
+func TestParseNetInfoEmpty(t *testing.T) {
+	var payload []byte
+	payload = append(payload, u32le(0)...) // 0 parents
+
+	msg := buildMsg(ServerNetInfo, payload)
+
+	parents, err := ParseNetInfo(msg)
+	if err != nil {
+		t.Fatalf("ParseNetInfo: %v", err)
+	}
+
+	if len(parents) != 0 {
+		t.Fatalf("got %d parents, want 0", len(parents))
+	}
+}
+
+func TestParseNetInfoTruncated(t *testing.T) {
+	var payload []byte
+	payload = append(payload, u32le(2)...) // says 2 parents
+	payload = appendStr(payload, "alice")
+	// missing IP and port for alice, and missing 2nd parent entirely
+
+	msg := buildMsg(ServerNetInfo, payload)
+
+	_, err := ParseNetInfo(msg)
+	if err == nil {
+		t.Fatal("expected error for truncated NetInfo")
+	}
+}
+
+func TestParseCannotConnect(t *testing.T) {
+	var payload []byte
+	payload = append(payload, u32le(12345)...) // token
+
+	msg := buildMsg(ServerCannotConnect, payload)
+
+	token, err := ParseCannotConnect(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != 12345 {
+		t.Fatalf("expected token 12345, got %d", token)
+	}
+}
+
+func TestParseCannotConnectTruncated(t *testing.T) {
+	// Empty payload — should fail.
+	msg := buildMsg(ServerCannotConnect, nil)
+
+	_, err := ParseCannotConnect(msg)
+	if err == nil {
+		t.Fatal("expected error for truncated CannotConnect")
+	}
+}

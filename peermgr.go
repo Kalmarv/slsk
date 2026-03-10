@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -31,6 +32,13 @@ type PeerMessage struct {
 // PeerMessageHandler handles a specific peer message type.
 type PeerMessageHandler func(msg *PeerMessage)
 
+// connectResult carries either a successful peer connection or an error
+// through the pendingTokens channel, enabling fast failure on CannotConnect.
+type connectResult struct {
+	pc  *PeerConn
+	err error
+}
+
 // PeerManager manages peer connections: listening for incoming,
 // establishing outgoing, and handling the init handshake.
 type PeerManager struct {
@@ -39,9 +47,9 @@ type PeerManager struct {
 	listener net.Listener
 
 	mu            sync.Mutex
-	pendingTokens map[uint32]chan *PeerConn              // tokens we're waiting for (indirect)
-	pendingAddrs  map[string][]chan *PeerAddressResponse // username -> waiters for address
-	msgHandlers   map[uint32]PeerMessageHandler         // message code -> handler
+	pendingTokens map[uint32]chan connectResult           // tokens we're waiting for (indirect)
+	pendingAddrs  map[string][]chan *PeerAddressResponse  // username -> waiters for address
+	msgHandlers   map[uint32]PeerMessageHandler          // message code -> handler
 
 	onFileConn PeerHandler // called for incoming F connections
 }
@@ -53,7 +61,7 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 	pm := &PeerManager{
 		username:      username,
 		client:        client,
-		pendingTokens: make(map[uint32]chan *PeerConn),
+		pendingTokens: make(map[uint32]chan connectResult),
 		pendingAddrs:  make(map[string][]chan *PeerAddressResponse),
 		msgHandlers:   make(map[uint32]PeerMessageHandler),
 	}
@@ -72,6 +80,22 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 
 		for _, ch := range waiters {
 			ch <- resp
+		}
+	})
+
+	// Handle CannotConnect: server tells us a peer can't reach us.
+	// Signal the pending indirect connection to fail fast instead of timing out.
+	client.OnCannotConnect(func(token uint32) {
+		pm.mu.Lock()
+		ch, ok := pm.pendingTokens[token]
+		pm.mu.Unlock()
+
+		if ok {
+			log.Printf("[peermgr] CannotConnect for token %d — failing fast", token)
+			select {
+			case ch <- connectResult{err: fmt.Errorf("server reported peer cannot connect (token %d)", token)}:
+			default:
+			}
 		}
 	})
 
@@ -156,7 +180,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 
 		if ok {
 			log.Printf("[peermgr] incoming PierceFirewall matched token %d", token)
-			ch <- &PeerConn{Conn: conn, Token: token}
+			ch <- connectResult{pc: &PeerConn{Conn: conn, Token: token}}
 		} else {
 			log.Printf("[peermgr] incoming PierceFirewall unmatched token %d (no pending)", token)
 			conn.Close()
@@ -199,48 +223,32 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
 	log.Printf("[peermgr] ConnectToPeer %s type=%s: getting address", username, connType)
 
-	// 1. Get peer address from server.
-	addrCh := make(chan *PeerAddressResponse, 1)
-
-	// Register as a waiter for this username's address response.
-	pm.mu.Lock()
-	pm.pendingAddrs[username] = append(pm.pendingAddrs[username], addrCh)
-	needsRequest := len(pm.pendingAddrs[username]) == 1 // first waiter sends the request
-	pm.mu.Unlock()
-
-	if needsRequest {
-		if err := pm.client.GetPeerAddress(username); err != nil {
-			return nil, fmt.Errorf("get peer address: %w", err)
-		}
+	addr, err := pm.getPeerAddress(ctx, username)
+	if err != nil {
+		return nil, err
 	}
-
-	// Wait for address response.
-	var addr *PeerAddressResponse
-	select {
-	case addr = <-addrCh:
-		log.Printf("[peermgr] ConnectToPeer %s: got address %s:%d", username, addr.IP, addr.Port)
-	case <-time.After(10 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for peer address of %s", username)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	log.Printf("[peermgr] ConnectToPeer %s: got address %s:%d", username, addr.IP, addr.Port)
 
 	// Generate a token for this connection.
 	token := generateToken()
 
-	// 2. Try direct connection.
-	directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer directCancel()
-
-	pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
-	if err == nil {
-		log.Printf("[peermgr] ConnectToPeer %s: direct connection succeeded", username)
-		return pc, nil
+	// Skip direct dial if address is clearly invalid (peer offline).
+	if !isValidAddr(addr) {
+		log.Printf("[peermgr] ConnectToPeer %s: invalid address %s:%d, trying indirect only", username, addr.IP, addr.Port)
+	} else {
+		// 2. Try direct connection.
+		directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
+		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
+		directCancel()
+		if err == nil {
+			log.Printf("[peermgr] ConnectToPeer %s: direct connection succeeded", username)
+			return pc, nil
+		}
+		log.Printf("[peermgr] ConnectToPeer %s: direct failed: %v, trying indirect", username, err)
 	}
-	log.Printf("[peermgr] ConnectToPeer %s: direct failed: %v, trying indirect", username, err)
 
 	// 3. Try indirect (NAT traversal via server).
-	pc, err = pm.connectIndirect(ctx, username, connType, token)
+	pc, err := pm.connectIndirect(ctx, username, connType, token)
 	if err != nil {
 		log.Printf("[peermgr] ConnectToPeer %s: indirect also failed: %v", username, err)
 		return nil, err
@@ -255,36 +263,23 @@ func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connT
 func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username string, connType string, token uint32) (*PeerConn, error) {
 	log.Printf("[peermgr] ConnectToPeerWithToken %s type=%s token=%d: getting address", username, connType, token)
 
-	addrCh := make(chan *PeerAddressResponse, 1)
-	pm.mu.Lock()
-	pm.pendingAddrs[username] = append(pm.pendingAddrs[username], addrCh)
-	needsRequest := len(pm.pendingAddrs[username]) == 1
-	pm.mu.Unlock()
+	addr, err := pm.getPeerAddress(ctx, username)
+	if err != nil {
+		return nil, err
+	}
 
-	if needsRequest {
-		if err := pm.client.GetPeerAddress(username); err != nil {
-			return nil, fmt.Errorf("get peer address: %w", err)
+	if !isValidAddr(addr) {
+		log.Printf("[peermgr] ConnectToPeerWithToken %s: invalid address %s:%d, trying indirect only", username, addr.IP, addr.Port)
+	} else {
+		directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
+		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
+		directCancel()
+		if err == nil {
+			return pc, nil
 		}
 	}
 
-	var addr *PeerAddressResponse
-	select {
-	case addr = <-addrCh:
-	case <-time.After(10 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for peer address of %s", username)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer directCancel()
-
-	pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
-	if err == nil {
-		return pc, nil
-	}
-
-	pc, err = pm.connectIndirect(ctx, username, connType, token)
+	pc, err := pm.connectIndirect(ctx, username, connType, token)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +316,7 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressRespo
 // connectIndirect asks the server to tell the peer to connect to us.
 func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType string, token uint32) (*PeerConn, error) {
 	// Register a pending token so we can match the incoming PierceFirewall.
-	ch := make(chan *PeerConn, 1)
+	ch := make(chan connectResult, 1)
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
 	pm.mu.Unlock()
@@ -337,12 +332,15 @@ func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType s
 		return nil, fmt.Errorf("send connect to peer: %w", err)
 	}
 
-	// Wait for the peer to connect back.
+	// Wait for the peer to connect back, or CannotConnect to fail fast.
 	select {
-	case pc := <-ch:
-		pc.Username = username
-		pc.Type = connType
-		return pc, nil
+	case result := <-ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		result.pc.Username = username
+		result.pc.Type = connType
+		return result.pc, nil
 	case <-time.After(15 * time.Second):
 		return nil, fmt.Errorf("timeout waiting for indirect connection from %s", username)
 	case <-ctx.Done():
@@ -356,6 +354,11 @@ func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType s
 func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	target := fmt.Sprintf("%s:%d", resp.IP.String(), resp.Port)
 	log.Printf("ConnectToPeer from %s type=%s addr=%s token=%d", resp.Username, resp.Type, target, resp.Token)
+
+	if resp.IP.IsUnspecified() || resp.Port == 0 {
+		log.Printf("[peermgr] ignoring ConnectToPeer from %s: invalid address %s", resp.Username, target)
+		return
+	}
 
 	var d net.Dialer
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -432,7 +435,59 @@ func (pm *PeerManager) routePeerMessages(pc *PeerConn) {
 	}
 }
 
-// generateToken returns a random-ish uint32 token.
+// generateToken returns a random uint32 token.
 func generateToken() uint32 {
-	return uint32(time.Now().UnixNano() & 0xFFFFFFFF)
+	return rand.Uint32()
+}
+
+// isValidAddr returns true if the peer address is usable for a direct connection.
+// The Soulseek server returns 0.0.0.0:0 for offline or unreachable peers.
+func isValidAddr(addr *PeerAddressResponse) bool {
+	return addr.IP != nil && !addr.IP.IsUnspecified() && addr.Port != 0
+}
+
+// getPeerAddress requests a peer's address from the server and waits for the response.
+// Deduplicates concurrent requests for the same username. Cleans up on timeout/cancel.
+func (pm *PeerManager) getPeerAddress(ctx context.Context, username string) (*PeerAddressResponse, error) {
+	addrCh := make(chan *PeerAddressResponse, 1)
+
+	pm.mu.Lock()
+	pm.pendingAddrs[username] = append(pm.pendingAddrs[username], addrCh)
+	needsRequest := len(pm.pendingAddrs[username]) == 1
+	pm.mu.Unlock()
+
+	if needsRequest {
+		if err := pm.client.GetPeerAddress(username); err != nil {
+			pm.removeAddrWaiter(username, addrCh)
+			return nil, fmt.Errorf("get peer address: %w", err)
+		}
+	}
+
+	select {
+	case addr := <-addrCh:
+		return addr, nil
+	case <-time.After(10 * time.Second):
+		pm.removeAddrWaiter(username, addrCh)
+		return nil, fmt.Errorf("timeout waiting for peer address of %s", username)
+	case <-ctx.Done():
+		pm.removeAddrWaiter(username, addrCh)
+		return nil, ctx.Err()
+	}
+}
+
+// removeAddrWaiter removes a specific channel from pendingAddrs to prevent leaks.
+func (pm *PeerManager) removeAddrWaiter(username string, ch chan *PeerAddressResponse) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	waiters := pm.pendingAddrs[username]
+	for i, w := range waiters {
+		if w == ch {
+			pm.pendingAddrs[username] = append(waiters[:i], waiters[i+1:]...)
+			break
+		}
+	}
+	if len(pm.pendingAddrs[username]) == 0 {
+		delete(pm.pendingAddrs, username)
+	}
 }

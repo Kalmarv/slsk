@@ -9,6 +9,7 @@ const (
 	ServerGetStatus        uint32 = 7
 	ServerConnectToPeer    uint32 = 18
 	ServerFileSearch       uint32 = 26
+	ServerSetStatus        uint32 = 28
 	ServerPing             uint32 = 32
 	ServerSharedFoldersFiles uint32 = 35
 	ServerGetUserStats     uint32 = 36
@@ -17,9 +18,13 @@ const (
 	ServerRoomList         uint32 = 64
 	ServerPrivilegedUsers  uint32 = 69
 	ServerHaveNoParent     uint32 = 71
+	ServerCheckPrivileges  uint32 = 92
 	ServerParentMinSpeed   uint32 = 83
 	ServerParentSpeedRatio uint32 = 84
+	ServerAcceptChildren   uint32 = 100
 	ServerNetInfo          uint32 = 102
+	ServerBranchLevel      uint32 = 126
+	ServerBranchRoot       uint32 = 127
 	ServerWishlistInterval uint32 = 104
 	ServerExcludedPhrases  uint32 = 160
 	ServerWishlistSearch   uint32 = 103

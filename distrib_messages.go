@@ -18,6 +18,61 @@ type DistribSearch struct {
 const distribSearchIdentifier uint32 = 49
 
 // ---------------------------------------------------------------------------
+// DistribBranchLevel (distrib code 4)
+// ---------------------------------------------------------------------------
+
+// BuildDistribBranchLevel builds a DistribBranchLevel message (distrib code 4).
+// Level 0 = branch root, children increment by 1.
+func BuildDistribBranchLevel(level uint32) []byte {
+	b := NewInitBuilder(DistribBranchLevel)
+	b.WriteUint32(level)
+	return b.Build()
+}
+
+// ParseDistribBranchLevel parses a DistribBranchLevel message (distrib code 4).
+func ParseDistribBranchLevel(msg []byte) (uint32, error) {
+	r, err := NewInitReader(msg)
+	if err != nil {
+		return 0, fmt.Errorf("distrib branch level: %w", err)
+	}
+	if r.Code() != DistribBranchLevel {
+		return 0, fmt.Errorf("distrib branch level: expected code %d, got %d", DistribBranchLevel, r.Code())
+	}
+	level, err := r.ReadUint32()
+	if err != nil {
+		return 0, fmt.Errorf("distrib branch level: %w", err)
+	}
+	return level, nil
+}
+
+// ---------------------------------------------------------------------------
+// DistribBranchRoot (distrib code 5)
+// ---------------------------------------------------------------------------
+
+// BuildDistribBranchRoot builds a DistribBranchRoot message (distrib code 5).
+func BuildDistribBranchRoot(username string) []byte {
+	b := NewInitBuilder(DistribBranchRoot)
+	b.WriteString(username)
+	return b.Build()
+}
+
+// ParseDistribBranchRoot parses a DistribBranchRoot message (distrib code 5).
+func ParseDistribBranchRoot(msg []byte) (string, error) {
+	r, err := NewInitReader(msg)
+	if err != nil {
+		return "", fmt.Errorf("distrib branch root: %w", err)
+	}
+	if r.Code() != DistribBranchRoot {
+		return "", fmt.Errorf("distrib branch root: expected code %d, got %d", DistribBranchRoot, r.Code())
+	}
+	username, err := r.ReadString()
+	if err != nil {
+		return "", fmt.Errorf("distrib branch root: %w", err)
+	}
+	return username, nil
+}
+
+// ---------------------------------------------------------------------------
 // Distributed Search Request (distrib code 3)
 // ---------------------------------------------------------------------------
 

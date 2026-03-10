@@ -47,6 +47,19 @@ func buildLoginFailureResponse(reason string) []byte {
 	return buildMsg(ServerLogin, payload)
 }
 
+// drainInitMessages reads and discards all post-login init messages
+// (CheckPrivileges, SetListenPort, SetStatus, HaveNoParent, BranchRoot,
+// BranchLevel, AcceptChildren). Uses a short deadline to avoid blocking.
+func drainInitMessages(sc *Conn) {
+	sc.Raw().SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		if _, err := sc.ReadMessage(); err != nil {
+			break
+		}
+	}
+	sc.Raw().SetReadDeadline(time.Time{}) // clear deadline
+}
+
 // handleLogin reads a login request and sends the given response.
 // Returns the login message for inspection, or nil on error.
 func handleLogin(t *testing.T, sc *Conn, response []byte) []byte {
@@ -72,16 +85,26 @@ func TestClient_LoginSuccess(t *testing.T) {
 		// Read login request, send success.
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Read the SetListenPort message the client sends after login.
-		msg, err := sc.ReadMessage()
-		if err != nil {
-			t.Errorf("mock server: read after login: %v", err)
-			return
+		// Read messages until we find SetListenPort (code 2).
+		// Other init messages (CheckPrivileges, etc.) come first.
+		for {
+			msg, err := sc.ReadMessage()
+			if err != nil {
+				t.Errorf("mock server: read after login: %v", err)
+				return
+			}
+			r, err := NewReader(msg)
+			if err != nil {
+				continue
+			}
+			if r.Code() == ServerSetListenPort {
+				setListenPortMsg <- msg
+				break
+			}
 		}
-		setListenPortMsg <- msg
 
-		// Drain HaveNoParent.
-		sc.ReadMessage()
+		// Drain remaining init messages.
+		drainInitMessages(sc)
 	})
 
 	cfg := ClientConfig{
@@ -249,9 +272,8 @@ func TestClient_PingResponse(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain SetListenPort + HaveNoParent.
-		sc.ReadMessage()
-		sc.ReadMessage()
+		// Drain post-login init messages.
+		drainInitMessages(sc)
 
 		// Send a ping to the client.
 		ping := BuildPing()
@@ -310,9 +332,8 @@ func TestClient_OnSearchRequest(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain SetListenPort + HaveNoParent.
-		sc.ReadMessage()
-		sc.ReadMessage()
+		// Drain post-login init messages.
+		drainInitMessages(sc)
 
 		// Send an incoming search request (code 93 = ServerEmbeddedMessage).
 		var payload []byte
@@ -376,9 +397,8 @@ func TestClient_OnConnectToPeer(t *testing.T) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
-		// Drain SetListenPort + HaveNoParent.
-		sc.ReadMessage()
-		sc.ReadMessage()
+		// Drain post-login init messages.
+		drainInitMessages(sc)
 
 		// Send a ConnectToPeer notification (code 18).
 		var payload []byte

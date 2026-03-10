@@ -136,3 +136,141 @@ func TestDistribSearchRequestTruncated(t *testing.T) {
 		t.Fatal("expected error for truncated message")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DistribBranchLevel (distrib code 4) tests
+// ---------------------------------------------------------------------------
+
+func TestBuildDistribBranchLevel(t *testing.T) {
+	msg := BuildDistribBranchLevel(3)
+
+	r, err := NewInitReader(msg)
+	if err != nil {
+		t.Fatalf("NewInitReader: %v", err)
+	}
+	if r.Code() != DistribBranchLevel {
+		t.Fatalf("code = %d, want %d", r.Code(), DistribBranchLevel)
+	}
+	level, err := r.ReadUint32()
+	if err != nil {
+		t.Fatalf("read level: %v", err)
+	}
+	if level != 3 {
+		t.Fatalf("level = %d, want 3", level)
+	}
+}
+
+func TestParseDistribBranchLevel(t *testing.T) {
+	b := NewInitBuilder(DistribBranchLevel)
+	b.WriteUint32(5)
+	msg := b.Build()
+
+	level, err := ParseDistribBranchLevel(msg)
+	if err != nil {
+		t.Fatalf("ParseDistribBranchLevel: %v", err)
+	}
+	if level != 5 {
+		t.Fatalf("level = %d, want 5", level)
+	}
+}
+
+func TestParseDistribBranchLevelZero(t *testing.T) {
+	b := NewInitBuilder(DistribBranchLevel)
+	b.WriteUint32(0)
+	msg := b.Build()
+
+	level, err := ParseDistribBranchLevel(msg)
+	if err != nil {
+		t.Fatalf("ParseDistribBranchLevel: %v", err)
+	}
+	if level != 0 {
+		t.Fatalf("level = %d, want 0", level)
+	}
+}
+
+func TestParseDistribBranchLevelBadCode(t *testing.T) {
+	b := NewInitBuilder(99)
+	b.WriteUint32(0)
+	msg := b.Build()
+
+	_, err := ParseDistribBranchLevel(msg)
+	if err == nil {
+		t.Fatal("expected error for wrong code")
+	}
+}
+
+func TestParseDistribBranchLevelTruncated(t *testing.T) {
+	_, err := ParseDistribBranchLevel([]byte{1, 2})
+	if err == nil {
+		t.Fatal("expected error for truncated message")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DistribBranchRoot (distrib code 5) tests
+// ---------------------------------------------------------------------------
+
+func TestBuildDistribBranchRoot(t *testing.T) {
+	msg := BuildDistribBranchRoot("rootuser")
+
+	r, err := NewInitReader(msg)
+	if err != nil {
+		t.Fatalf("NewInitReader: %v", err)
+	}
+	if r.Code() != DistribBranchRoot {
+		t.Fatalf("code = %d, want %d", r.Code(), DistribBranchRoot)
+	}
+	username, err := r.ReadString()
+	if err != nil {
+		t.Fatalf("read username: %v", err)
+	}
+	if username != "rootuser" {
+		t.Fatalf("username = %q, want rootuser", username)
+	}
+}
+
+func TestParseDistribBranchRoot(t *testing.T) {
+	b := NewInitBuilder(DistribBranchRoot)
+	b.WriteString("therootnode")
+	msg := b.Build()
+
+	username, err := ParseDistribBranchRoot(msg)
+	if err != nil {
+		t.Fatalf("ParseDistribBranchRoot: %v", err)
+	}
+	if username != "therootnode" {
+		t.Fatalf("username = %q, want therootnode", username)
+	}
+}
+
+func TestParseDistribBranchRootEmpty(t *testing.T) {
+	b := NewInitBuilder(DistribBranchRoot)
+	b.WriteString("")
+	msg := b.Build()
+
+	username, err := ParseDistribBranchRoot(msg)
+	if err != nil {
+		t.Fatalf("ParseDistribBranchRoot: %v", err)
+	}
+	if username != "" {
+		t.Fatalf("username = %q, want empty", username)
+	}
+}
+
+func TestParseDistribBranchRootBadCode(t *testing.T) {
+	b := NewInitBuilder(99)
+	b.WriteString("user")
+	msg := b.Build()
+
+	_, err := ParseDistribBranchRoot(msg)
+	if err == nil {
+		t.Fatal("expected error for wrong code")
+	}
+}
+
+func TestParseDistribBranchRootTruncated(t *testing.T) {
+	_, err := ParseDistribBranchRoot([]byte{1, 2})
+	if err == nil {
+		t.Fatal("expected error for truncated message")
+	}
+}

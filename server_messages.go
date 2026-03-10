@@ -66,6 +66,13 @@ type IncomingSearchRequest struct {
 	Query    string
 }
 
+// PotentialParent is a candidate distributed parent from NetInfo (code 102).
+type PotentialParent struct {
+	Username string
+	IP       net.IP
+	Port     uint32
+}
+
 // ---------------------------------------------------------------------------
 // IP helpers
 // ---------------------------------------------------------------------------
@@ -148,12 +155,47 @@ func BuildSharedFoldersFiles(dirs, files uint32) []byte {
 	return b.Build()
 }
 
+// BuildCheckPrivileges builds a CheckPrivileges message (code 92).
+func BuildCheckPrivileges() []byte {
+	b := NewBuilder(ServerCheckPrivileges)
+	return b.Build()
+}
+
+// BuildSetStatus builds a SetStatus message (code 28).
+// Status values: 1 = Away, 2 = Online.
+func BuildSetStatus(status uint32) []byte {
+	b := NewBuilder(ServerSetStatus)
+	b.WriteUint32(status)
+	return b.Build()
+}
+
 // BuildHaveNoParent builds a HaveNoParent message (code 71).
 // Tells the server this client has no parent in the distributed search tree.
 // The server will then send search requests directly via EmbeddedMessage (code 93).
 func BuildHaveNoParent(noParent bool) []byte {
 	b := NewBuilder(ServerHaveNoParent)
 	b.WriteBool(noParent)
+	return b.Build()
+}
+
+// BuildBranchLevel builds a BranchLevel message (code 126).
+func BuildBranchLevel(level uint32) []byte {
+	b := NewBuilder(ServerBranchLevel)
+	b.WriteUint32(level)
+	return b.Build()
+}
+
+// BuildBranchRoot builds a BranchRoot message (code 127).
+func BuildBranchRoot(username string) []byte {
+	b := NewBuilder(ServerBranchRoot)
+	b.WriteString(username)
+	return b.Build()
+}
+
+// BuildAcceptChildren builds an AcceptChildren message (code 100).
+func BuildAcceptChildren(accept bool) []byte {
+	b := NewBuilder(ServerAcceptChildren)
+	b.WriteBool(accept)
 	return b.Build()
 }
 
@@ -444,4 +486,57 @@ func ParseServerSearchRequest(msg []byte) (*IncomingSearchRequest, error) {
 		Token:    token,
 		Query:    query,
 	}, nil
+}
+
+// ParseNetInfo parses a NetInfo/PossibleParents response (code 102).
+// Wire format: [uint32 count][for each: string username, uint32 IP (reversed), uint32 port]
+func ParseNetInfo(msg []byte) ([]PotentialParent, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parse net info: %w", err)
+	}
+
+	count, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse net info: read count: %w", err)
+	}
+
+	parents := make([]PotentialParent, 0, count)
+	for i := uint32(0); i < count; i++ {
+		username, err := r.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("parse net info: read username[%d]: %w", i, err)
+		}
+		ip, err := readReversedIP(r)
+		if err != nil {
+			return nil, fmt.Errorf("parse net info: read IP[%d]: %w", i, err)
+		}
+		port, err := r.ReadUint32()
+		if err != nil {
+			return nil, fmt.Errorf("parse net info: read port[%d]: %w", i, err)
+		}
+		parents = append(parents, PotentialParent{
+			Username: username,
+			IP:       ip,
+			Port:     port,
+		})
+	}
+
+	return parents, nil
+}
+
+// ParseCannotConnect parses a CannotConnect message (code 1001).
+// Wire format: [4-byte length][4-byte code=1001][4-byte token]
+// The token identifies which ConnectToPeer request failed.
+func ParseCannotConnect(msg []byte) (uint32, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return 0, fmt.Errorf("parse cannot connect: %w", err)
+	}
+
+	token, err := r.ReadUint32()
+	if err != nil {
+		return 0, fmt.Errorf("parse cannot connect: read token: %w", err)
+	}
+	return token, nil
 }

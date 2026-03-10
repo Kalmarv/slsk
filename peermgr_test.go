@@ -17,7 +17,7 @@ import (
 func newTestPeerManager(username string) *PeerManager {
 	return &PeerManager{
 		username:      username,
-		pendingTokens: make(map[uint32]chan *PeerConn),
+		pendingTokens: make(map[uint32]chan connectResult),
 		pendingAddrs:  make(map[string][]chan *PeerAddressResponse),
 		msgHandlers:   make(map[uint32]PeerMessageHandler),
 	}
@@ -125,7 +125,7 @@ func TestPeerManager_HandleIncoming_PierceFirewall_MatchingToken(t *testing.T) {
 
 	// Register a pending token.
 	token := uint32(12345)
-	ch := make(chan *PeerConn, 1)
+	ch := make(chan connectResult, 1)
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
 	pm.mu.Unlock()
@@ -142,9 +142,10 @@ func TestPeerManager_HandleIncoming_PierceFirewall_MatchingToken(t *testing.T) {
 	pm.handleIncoming(local)
 
 	select {
-	case pc := <-ch:
-		assert.Equal(t, token, pc.Token)
-		assert.NotNil(t, pc.Conn)
+	case result := <-ch:
+		require.NoError(t, result.err)
+		assert.Equal(t, token, result.pc.Token)
+		assert.NotNil(t, result.pc.Conn)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for pierce firewall token match")
 	}
@@ -284,7 +285,7 @@ func TestPeerManager_Listen_AcceptsPierceFirewall(t *testing.T) {
 
 	// Register a pending token.
 	token := uint32(54321)
-	ch := make(chan *PeerConn, 1)
+	ch := make(chan connectResult, 1)
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
 	pm.mu.Unlock()
@@ -321,9 +322,10 @@ func TestPeerManager_Listen_AcceptsPierceFirewall(t *testing.T) {
 	require.NoError(t, err)
 
 	select {
-	case pc := <-ch:
-		assert.Equal(t, token, pc.Token)
-		assert.NotNil(t, pc.Conn)
+	case result := <-ch:
+		require.NoError(t, result.err)
+		assert.Equal(t, token, result.pc.Token)
+		assert.NotNil(t, result.pc.Conn)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for pierce firewall via listener")
 	}
@@ -420,7 +422,7 @@ func TestPeerManager_PendingTokens_RegisterAndMatch(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	token := uint32(77777)
-	ch := make(chan *PeerConn, 1)
+	ch := make(chan connectResult, 1)
 
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
@@ -447,10 +449,10 @@ func TestPeerManager_PendingTokens_MultipleTokens(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	tokens := []uint32{100, 200, 300}
-	channels := make([]chan *PeerConn, len(tokens))
+	channels := make([]chan connectResult, len(tokens))
 
 	for i, tok := range tokens {
-		channels[i] = make(chan *PeerConn, 1)
+		channels[i] = make(chan connectResult, 1)
 		pm.mu.Lock()
 		pm.pendingTokens[tok] = channels[i]
 		pm.mu.Unlock()
@@ -468,8 +470,9 @@ func TestPeerManager_PendingTokens_MultipleTokens(t *testing.T) {
 		pm.handleIncoming(local)
 
 		select {
-		case pc := <-channels[i]:
-			assert.Equal(t, tok, pc.Token, "token %d should match", i)
+		case result := <-channels[i]:
+			require.NoError(t, result.err)
+			assert.Equal(t, tok, result.pc.Token, "token %d should match", i)
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for token %d", tok)
 		}
@@ -518,17 +521,20 @@ func TestPeerManager_NoFileHandler_DoesNotPanic(t *testing.T) {
 // generateToken test
 // ---------------------------------------------------------------------------
 
-func TestGenerateToken_NotZero(t *testing.T) {
-	// Generate several tokens and verify they are non-zero.
-	// (generateToken is time-based so they should differ if called with delay.)
-	seen := make(map[uint32]bool)
-	for i := 0; i < 10; i++ {
-		tok := generateToken()
-		seen[tok] = true
-		time.Sleep(1 * time.Millisecond) // ensure time advances
+func TestGenerateToken_Unique(t *testing.T) {
+	// Generate tokens concurrently and verify no collisions.
+	const n = 100
+	tokens := make(chan uint32, n)
+	for i := 0; i < n; i++ {
+		go func() { tokens <- generateToken() }()
 	}
-	// With 10 samples spaced 1ms apart, we should have some unique values.
-	assert.Greater(t, len(seen), 1, "expected multiple unique tokens")
+	seen := make(map[uint32]bool)
+	for i := 0; i < n; i++ {
+		tok := <-tokens
+		seen[tok] = true
+	}
+	// With random uint32, 100 tokens should all be unique.
+	assert.Equal(t, n, len(seen), "expected all unique tokens")
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +547,7 @@ func TestPeerManager_ConnectIndirect_TokenDelivery(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	token := uint32(88888)
-	ch := make(chan *PeerConn, 1)
+	ch := make(chan connectResult, 1)
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
 	pm.mu.Unlock()
@@ -560,9 +566,10 @@ func TestPeerManager_ConnectIndirect_TokenDelivery(t *testing.T) {
 
 	// The channel should receive the connection.
 	select {
-	case pc := <-ch:
-		assert.Equal(t, token, pc.Token)
-		assert.NotNil(t, pc.Conn)
+	case result := <-ch:
+		require.NoError(t, result.err)
+		assert.Equal(t, token, result.pc.Token)
+		assert.NotNil(t, result.pc.Conn)
 		// In connectIndirect, Username and Type would be set after receiving.
 		// Here we just verify the token matching works.
 	case <-time.After(2 * time.Second):
@@ -718,4 +725,107 @@ func TestPeerManager_HandleIncoming_ImmediateClose(t *testing.T) {
 
 	// handleIncoming should return without panicking.
 	pm.handleIncoming(local)
+}
+
+// ---------------------------------------------------------------------------
+// Address validation tests
+// ---------------------------------------------------------------------------
+
+func TestIsValidAddr(t *testing.T) {
+	tests := []struct {
+		name  string
+		addr  *PeerAddressResponse
+		valid bool
+	}{
+		{"normal address", &PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 2234}, true},
+		{"zero IP", &PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 2234}, false},
+		{"zero port", &PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 0}, false},
+		{"both zero", &PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 0}, false},
+		{"nil IP", &PeerAddressResponse{IP: nil, Port: 2234}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.valid, isValidAddr(tt.addr))
+		})
+	}
+}
+
+func TestPeerManager_HandleConnectToPeer_InvalidAddr(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	// Should return immediately without dialing.
+	resp := &ConnectToPeerResponse{
+		Username: "ghost",
+		Type:     ConnTypePeer,
+		IP:       net.ParseIP("0.0.0.0"),
+		Port:     0,
+		Token:    55555,
+	}
+
+	// Should not panic or block.
+	pm.handleConnectToPeer(resp)
+}
+
+// ---------------------------------------------------------------------------
+// CannotConnect fast-fail test
+// ---------------------------------------------------------------------------
+
+func TestPeerManager_CannotConnect_FailsFast(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	// Register a pending token as connectIndirect would.
+	token := uint32(44444)
+	ch := make(chan connectResult, 1)
+	pm.mu.Lock()
+	pm.pendingTokens[token] = ch
+	pm.mu.Unlock()
+
+	// Simulate CannotConnect arriving.
+	pm.mu.Lock()
+	resultCh, ok := pm.pendingTokens[token]
+	pm.mu.Unlock()
+	require.True(t, ok)
+
+	resultCh <- connectResult{err: fmt.Errorf("server reported peer cannot connect (token %d)", token)}
+
+	// Should receive the error immediately.
+	select {
+	case result := <-ch:
+		assert.Error(t, result.err)
+		assert.Contains(t, result.err.Error(), "cannot connect")
+	case <-time.After(1 * time.Second):
+		t.Fatal("CannotConnect should have unblocked immediately")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pendingAddrs cleanup test
+// ---------------------------------------------------------------------------
+
+func TestPeerManager_RemoveAddrWaiter(t *testing.T) {
+	pm := newTestPeerManager("localuser")
+
+	ch1 := make(chan *PeerAddressResponse, 1)
+	ch2 := make(chan *PeerAddressResponse, 1)
+
+	pm.mu.Lock()
+	pm.pendingAddrs["user1"] = append(pm.pendingAddrs["user1"], ch1)
+	pm.pendingAddrs["user1"] = append(pm.pendingAddrs["user1"], ch2)
+	pm.mu.Unlock()
+
+	// Remove first waiter.
+	pm.removeAddrWaiter("user1", ch1)
+
+	pm.mu.Lock()
+	remaining := len(pm.pendingAddrs["user1"])
+	pm.mu.Unlock()
+	assert.Equal(t, 1, remaining, "should have 1 waiter remaining")
+
+	// Remove second waiter — should delete the key entirely.
+	pm.removeAddrWaiter("user1", ch2)
+
+	pm.mu.Lock()
+	_, exists := pm.pendingAddrs["user1"]
+	pm.mu.Unlock()
+	assert.False(t, exists, "key should be deleted when no waiters remain")
 }
