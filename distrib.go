@@ -15,7 +15,7 @@ import (
 // all received searches to a callback.
 type DistribManager struct {
 	username string
-	onSearch func(*DistribSearch)
+	onSearch func(*IncomingSearchRequest)
 
 	mu         sync.Mutex
 	parentConn *Conn
@@ -32,7 +32,7 @@ type DistribManager struct {
 }
 
 // NewDistribManager creates a new DistribManager.
-func NewDistribManager(username string, onSearch func(*DistribSearch)) *DistribManager {
+func NewDistribManager(username string, onSearch func(*IncomingSearchRequest)) *DistribManager {
 	return &DistribManager{
 		username: username,
 		onSearch: onSearch,

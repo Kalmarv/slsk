@@ -12,8 +12,6 @@ const (
 	ServerSetStatus        uint32 = 28
 	ServerPing             uint32 = 32
 	ServerSharedFoldersFiles uint32 = 35
-	ServerGetUserStats     uint32 = 36
-	ServerUserSearch       uint32 = 42
 	ServerEmbeddedMessage  uint32 = 93
 	ServerRoomList         uint32 = 64
 	ServerPrivilegedUsers  uint32 = 69
@@ -27,15 +25,11 @@ const (
 	ServerBranchRoot       uint32 = 127
 	ServerWishlistInterval uint32 = 104
 	ServerExcludedPhrases  uint32 = 160
-	ServerWishlistSearch   uint32 = 103
 	ServerCannotConnect    uint32 = 1001
 )
 
 // Peer message codes (4-byte LE code in peer↔peer messages).
 const (
-	PeerBrowseRequest       uint32 = 4
-	PeerBrowseResponse      uint32 = 5
-	PeerSearchRequest       uint32 = 8
 	PeerSearchResponse      uint32 = 9
 	PeerTransferRequest     uint32 = 40
 	PeerTransferResponse    uint32 = 41
@@ -48,7 +42,6 @@ const (
 
 // Distributed message codes (1-byte code).
 const (
-	DistribPing           uint8 = 0
 	DistribSearchRequest  uint8 = 3
 	DistribBranchLevel    uint8 = 4
 	DistribBranchRoot     uint8 = 5

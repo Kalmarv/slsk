@@ -2,7 +2,6 @@ package slsk
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -512,7 +511,3 @@ func TestClient_Close(t *testing.T) {
 		t.Fatal("expected Search to fail after Close")
 	}
 }
-
-// Suppress unused import warnings — binary is used by buildMsg/u32le helpers
-// in server_messages_test.go but we reference it here for the test helper below.
-var _ = binary.LittleEndian

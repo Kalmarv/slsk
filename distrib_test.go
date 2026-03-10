@@ -11,7 +11,7 @@ import (
 // startDistribParent starts a TCP listener that simulates a distributed parent.
 // It accepts one connection, sends BranchLevel, BranchRoot, and a search request,
 // then keeps the connection open. Returns the listener address.
-func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, search *DistribSearch) string {
+func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, search *IncomingSearchRequest) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -64,7 +64,7 @@ func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, sea
 }
 
 func TestDistribManager_ConnectsToParent(t *testing.T) {
-	search := &DistribSearch{
+	search := &IncomingSearchRequest{
 		Username: "searcher",
 		Token:    12345,
 		Query:    "test query",
@@ -76,8 +76,8 @@ func TestDistribManager_ConnectsToParent(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &port)
 	ip := net.ParseIP(host).To4()
 
-	searchReceived := make(chan *DistribSearch, 1)
-	dm := NewDistribManager("testuser", func(s *DistribSearch) {
+	searchReceived := make(chan *IncomingSearchRequest, 1)
+	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
@@ -119,7 +119,7 @@ func TestDistribManager_ConnectsToParent(t *testing.T) {
 func TestDistribManager_AdoptsFirstValidParent(t *testing.T) {
 	// First parent: unreachable.
 	// Second parent: valid.
-	search := &DistribSearch{
+	search := &IncomingSearchRequest{
 		Username: "searcher",
 		Token:    42,
 		Query:    "music",
@@ -131,8 +131,8 @@ func TestDistribManager_AdoptsFirstValidParent(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &port)
 	ip := net.ParseIP(host).To4()
 
-	searchReceived := make(chan *DistribSearch, 1)
-	dm := NewDistribManager("testuser", func(s *DistribSearch) {
+	searchReceived := make(chan *IncomingSearchRequest, 1)
+	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
@@ -211,7 +211,7 @@ func TestDistribManager_ForwardsMultipleSearches(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	var count atomic.Int32
-	dm := NewDistribManager("testuser", func(s *DistribSearch) {
+	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
 		count.Add(1)
 	})
 
@@ -273,7 +273,7 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *DistribSearch) {
+	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:
@@ -305,7 +305,7 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 }
 
 func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
-	search := &DistribSearch{
+	search := &IncomingSearchRequest{
 		Username: "searcher",
 		Token:    1,
 		Query:    "query",
@@ -318,7 +318,7 @@ func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *DistribSearch) {
+	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:

@@ -221,40 +221,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 // ConnectToPeer establishes a peer connection, trying direct first then indirect.
 // Returns a connected PeerConn ready for message exchange.
 func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
-	log.Printf("[peermgr] ConnectToPeer %s type=%s: getting address", username, connType)
-
-	addr, err := pm.getPeerAddress(ctx, username)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[peermgr] ConnectToPeer %s: got address %s:%d", username, addr.IP, addr.Port)
-
-	// Generate a token for this connection.
-	token := generateToken()
-
-	// Skip direct dial if address is clearly invalid (peer offline).
-	if !isValidAddr(addr) {
-		log.Printf("[peermgr] ConnectToPeer %s: invalid address %s:%d, trying indirect only", username, addr.IP, addr.Port)
-	} else {
-		// 2. Try direct connection.
-		directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
-		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
-		directCancel()
-		if err == nil {
-			log.Printf("[peermgr] ConnectToPeer %s: direct connection succeeded", username)
-			return pc, nil
-		}
-		log.Printf("[peermgr] ConnectToPeer %s: direct failed: %v, trying indirect", username, err)
-	}
-
-	// 3. Try indirect (NAT traversal via server).
-	pc, err := pm.connectIndirect(ctx, username, connType, token)
-	if err != nil {
-		log.Printf("[peermgr] ConnectToPeer %s: indirect also failed: %v", username, err)
-		return nil, err
-	}
-	log.Printf("[peermgr] ConnectToPeer %s: indirect connection succeeded", username)
-	return pc, nil
+	return pm.ConnectToPeerWithToken(ctx, username, connType, generateToken())
 }
 
 // ConnectToPeerWithToken is like ConnectToPeer but uses the specified token

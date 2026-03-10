@@ -572,7 +572,6 @@ func TestCodeConstants(t *testing.T) {
 		{"ServerCannotConnect", ServerCannotConnect, uint32(1001)},
 		{"PeerSearchResponse", PeerSearchResponse, uint32(9)},
 		{"PeerTransferRequest", PeerTransferRequest, uint32(40)},
-		{"DistribPing", DistribPing, uint8(0)},
 		{"DistribBranchRoot", DistribBranchRoot, uint8(5)},
 		{"InitPierceFirewall", InitPierceFirewall, uint8(0)},
 		{"InitPeerInit", InitPeerInit, uint8(1)},
