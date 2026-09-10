@@ -3,7 +3,7 @@ package slsk
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -80,7 +80,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 	var d net.Dialer
 	raw, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
-		log.Printf("[distrib] failed to connect to parent %s at %s: %v", p.Username, target, err)
+		slog.Debug("failed to connect to parent", "component", "distrib", "user", p.Username, "addr", target, "err", err)
 		return false
 	}
 
@@ -90,7 +90,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 	initMsg := BuildPeerInit(dm.username, ConnTypeDistributed, 0)
 	if err := conn.WriteMessage(initMsg); err != nil {
 		conn.Close()
-		log.Printf("[distrib] failed to send PeerInit to %s: %v", p.Username, err)
+		slog.Debug("failed to send PeerInit", "component", "distrib", "user", p.Username, "err", err)
 		return false
 	}
 
@@ -119,7 +119,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 		case DistribBranchLevel:
 			level, err = ParseDistribBranchLevel(msg)
 			if err != nil {
-				log.Printf("[distrib] parse branch level from %s: %v", p.Username, err)
+				slog.Warn("parse branch level", "component", "distrib", "user", p.Username, "err", err)
 				conn.Close()
 				return false
 			}
@@ -128,7 +128,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 		case DistribBranchRoot:
 			root, err = ParseDistribBranchRoot(msg)
 			if err != nil {
-				log.Printf("[distrib] parse branch root from %s: %v", p.Username, err)
+				slog.Warn("parse branch root", "component", "distrib", "user", p.Username, "err", err)
 				conn.Close()
 				return false
 			}
@@ -155,7 +155,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 			dm.hasParent = true
 			dm.mu.Unlock()
 
-			log.Printf("[distrib] adopted parent %s (level=%d, root=%s)", p.Username, level, root)
+			slog.Info("adopted parent", "component", "distrib", "user", p.Username, "level", level, "root", root)
 
 			if dm.OnParentChange != nil {
 				dm.OnParentChange(true, level+1, root)
@@ -186,7 +186,7 @@ func (dm *DistribManager) readLoop(conn *Conn, parentUsername string) {
 		dm.branchRoot = ""
 		dm.mu.Unlock()
 
-		log.Printf("[distrib] parent %s disconnected", parentUsername)
+		slog.Info("parent disconnected", "component", "distrib", "user", parentUsername)
 
 		if dm.OnParentChange != nil {
 			dm.OnParentChange(false, 0, dm.username)
@@ -209,7 +209,7 @@ func (dm *DistribManager) readLoop(conn *Conn, parentUsername string) {
 		case DistribSearchRequest:
 			search, err := ParseDistribSearchRequest(msg)
 			if err != nil {
-				log.Printf("[distrib] parse search from %s: %v", parentUsername, err)
+				slog.Warn("parse search", "component", "distrib", "user", parentUsername, "err", err)
 				continue
 			}
 			if dm.onSearch != nil {

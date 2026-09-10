@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ClientConfig holds the configuration for connecting to the Soulseek server.
@@ -25,8 +26,9 @@ type ClientConfig struct {
 type Client struct {
 	cfg      ClientConfig
 	conn     *Conn
+	done     chan struct{} // closed when the current connection's message loop exits
 	loggedIn atomic.Bool
-	mu       sync.Mutex // protects conn field
+	mu       sync.Mutex // protects conn and done
 
 	// Event callbacks
 	onSearchRequest  func(*IncomingSearchRequest)
@@ -64,6 +66,35 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	return &Client{cfg: cfg}, nil
 }
 
+var errNotLoggedIn = errors.New("not logged in")
+
+// loginTimeout bounds the TCP dial plus login handshake.
+const loginTimeout = 30 * time.Second
+
+// write sends a framed message to the server when logged in.
+// It is safe for concurrent use and during a reconnect.
+func (c *Client) write(msg []byte) error {
+	if !c.loggedIn.Load() {
+		return errNotLoggedIn
+	}
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return errNotLoggedIn
+	}
+	return conn.WriteMessage(msg)
+}
+
+// Done returns a channel closed when the current server connection's message
+// loop exits (connection lost or Close called). A fresh channel is created by
+// each successful Connect; it is nil before the first Connect.
+func (c *Client) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.done
+}
+
 // Connect dials the Soulseek server, performs login, and on success sends
 // SetListenPort and starts the background message loop.
 func (c *Client) Connect(ctx context.Context) error {
@@ -78,6 +109,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	c.conn = conn
 	c.mu.Unlock()
+
+	// Bound the login handshake so a half-open connection cannot block the
+	// caller forever. Cleared once the connection is fully established.
+	if err := raw.SetDeadline(time.Now().Add(loginTimeout)); err != nil {
+		conn.Close()
+		return fmt.Errorf("set login deadline: %w", err)
+	}
 
 	// Send login request.
 	loginMsg := BuildLoginRequest(c.cfg.Username, c.cfg.Password, c.cfg.MajorVersion, c.cfg.MinorVersion)
@@ -117,7 +155,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		{"HaveNoParent", BuildHaveNoParent(true)},
 		{"BranchRoot", BuildBranchRoot(c.cfg.Username)},
 		{"BranchLevel", BuildBranchLevel(0)},
-		{"AcceptChildren", BuildAcceptChildren(true)},
+		// We do not implement the child side of the distributed tree, so do
+		// not advertise that we accept children (the server would otherwise
+		// assign us peers we immediately reject).
+		{"AcceptChildren", BuildAcceptChildren(false)},
 	}
 	for _, m := range initMsgs {
 		if err := conn.WriteMessage(m.data); err != nil {
@@ -127,8 +168,17 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
-	// Start background message loop.
-	go c.messageLoop()
+	// Start background message loop for this connection.
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		c.loggedIn.Store(false)
+		conn.Close()
+		return fmt.Errorf("clear login deadline: %w", err)
+	}
+	done := make(chan struct{})
+	c.mu.Lock()
+	c.done = done
+	c.mu.Unlock()
+	go c.messageLoop(conn, done)
 
 	return nil
 }
@@ -158,38 +208,22 @@ func (c *Client) ListenPort() uint32 {
 
 // Search sends a file search request to the server.
 func (c *Client) Search(token uint32, query string) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildFileSearchRequest(token, query)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildFileSearchRequest(token, query))
 }
 
 // GetPeerAddress sends a GetPeerAddress request to the server.
 func (c *Client) GetPeerAddress(username string) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildGetPeerAddressRequest(username)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildGetPeerAddressRequest(username))
 }
 
 // SendConnectToPeer sends a ConnectToPeer request to the server.
 func (c *Client) SendConnectToPeer(token uint32, username, connType string) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildConnectToPeerRequest(token, username, connType)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildConnectToPeerRequest(token, username, connType))
 }
 
 // SendSharedFoldersFiles reports share counts to the server.
 func (c *Client) SendSharedFoldersFiles(dirs, files uint32) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildSharedFoldersFiles(dirs, files)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildSharedFoldersFiles(dirs, files))
 }
 
 // OnSearchRequest registers a callback for incoming search requests.
@@ -209,20 +243,12 @@ func (c *Client) OnPeerAddress(fn func(*PeerAddressResponse)) {
 
 // GetUserStatus sends a GetUserStatus request (code 7) for the given username.
 func (c *Client) GetUserStatus(username string) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildGetUserStatusRequest(username)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildGetUserStatusRequest(username))
 }
 
 // WatchUser sends a WatchUser request (code 5) for the given username.
 func (c *Client) WatchUser(username string) error {
-	if !c.loggedIn.Load() {
-		return errors.New("not logged in")
-	}
-	msg := BuildWatchUserRequest(username)
-	return c.conn.WriteMessage(msg)
+	return c.write(BuildWatchUserRequest(username))
 }
 
 // OnUserStatus registers a callback for GetUserStatus responses (code 7).
@@ -246,31 +272,32 @@ func (c *Client) OnCannotConnect(fn func(token uint32)) {
 func (c *Client) SetDistribManager(dm *DistribManager) {
 	c.distribMgr = dm
 	dm.OnParentChange = func(hasParent bool, branchLevel uint32, branchRoot string) {
-		if !c.loggedIn.Load() {
-			return
-		}
 		// Tell server whether we have a parent.
-		if err := c.conn.WriteMessage(BuildHaveNoParent(!hasParent)); err != nil {
-			log.Printf("slsk: send HaveNoParent: %v", err)
+		if err := c.write(BuildHaveNoParent(!hasParent)); err != nil {
+			slog.Error("send HaveNoParent", "component", "slsk", "err", err)
 		}
-		if err := c.conn.WriteMessage(BuildBranchLevel(branchLevel)); err != nil {
-			log.Printf("slsk: send BranchLevel: %v", err)
+		if err := c.write(BuildBranchLevel(branchLevel)); err != nil {
+			slog.Error("send BranchLevel", "component", "slsk", "err", err)
 		}
-		if err := c.conn.WriteMessage(BuildBranchRoot(branchRoot)); err != nil {
-			log.Printf("slsk: send BranchRoot: %v", err)
+		if err := c.write(BuildBranchRoot(branchRoot)); err != nil {
+			slog.Error("send BranchRoot", "component", "slsk", "err", err)
 		}
-		log.Printf("slsk: distrib state update: hasParent=%v level=%d root=%s", hasParent, branchLevel, branchRoot)
+		slog.Debug("distrib state update", "component", "slsk", "hasParent", hasParent, "level", branchLevel, "root", branchRoot)
 	}
 }
 
 // messageLoop reads messages from the server in a loop and dispatches
-// them by code. It runs in a goroutine and exits on read error.
-func (c *Client) messageLoop() {
+// them by code. It runs in a goroutine, owns conn for reads, and closes done
+// when the connection drops.
+func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
+	defer close(done)
 	for {
-		msg, err := c.conn.ReadMessage()
+		msg, err := conn.ReadMessage()
 		if err != nil {
 			// Connection closed or error — exit the loop.
+			slog.Warn("slsk server connection lost", "component", "slsk", "err", err)
 			c.loggedIn.Store(false)
+			_ = conn.Close()
 			return
 		}
 
@@ -284,16 +311,16 @@ func (c *Client) messageLoop() {
 		case ServerPing:
 			// Respond with a ping.
 			pong := BuildPing()
-			if err := c.conn.WriteMessage(pong); err != nil {
-				log.Printf("slsk: failed to send pong: %v", err)
+			if err := conn.WriteMessage(pong); err != nil {
+				slog.Error("failed to send pong", "component", "slsk", "err", err)
 			}
 
 		case ServerEmbeddedMessage:
 			// Incoming search request (code 93).
-			log.Printf("slsk: received EmbeddedMessage (%d bytes)", len(msg))
+			slog.Debug("received EmbeddedMessage", "component", "slsk", "bytes", len(msg))
 			req, err := ParseServerSearchRequest(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse search request: %v", err)
+				slog.Warn("failed to parse search request", "component", "slsk", "err", err)
 				continue
 			}
 			if c.onSearchRequest != nil {
@@ -303,7 +330,7 @@ func (c *Client) messageLoop() {
 		case ServerConnectToPeer:
 			resp, err := ParseConnectToPeerResponse(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse connect to peer: %v", err)
+				slog.Warn("failed to parse connect to peer", "component", "slsk", "err", err)
 				continue
 			}
 			if c.onConnectToPeer != nil {
@@ -313,7 +340,7 @@ func (c *Client) messageLoop() {
 		case ServerGetPeerAddress:
 			resp, err := ParseGetPeerAddressResponse(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse peer address: %v", err)
+				slog.Warn("failed to parse peer address", "component", "slsk", "err", err)
 				continue
 			}
 			if c.onPeerAddress != nil {
@@ -323,7 +350,7 @@ func (c *Client) messageLoop() {
 		case ServerWatchUser:
 			resp, err := ParseWatchUserResponse(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse watch user response: %v", err)
+				slog.Warn("failed to parse watch user response", "component", "slsk", "err", err)
 				continue
 			}
 			if resp.Exists && c.onUserStatus != nil {
@@ -336,7 +363,7 @@ func (c *Client) messageLoop() {
 		case ServerGetStatus:
 			resp, err := ParseGetUserStatusResponse(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse user status: %v", err)
+				slog.Warn("failed to parse user status", "component", "slsk", "err", err)
 				continue
 			}
 			if c.onUserStatus != nil {
@@ -346,10 +373,10 @@ func (c *Client) messageLoop() {
 		case ServerCannotConnect:
 			token, err := ParseCannotConnect(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse CannotConnect: %v", err)
+				slog.Warn("failed to parse CannotConnect", "component", "slsk", "err", err)
 				continue
 			}
-			log.Printf("slsk: CannotConnect token=%d", token)
+			slog.Debug("CannotConnect", "component", "slsk", "token", token)
 			if c.onCannotConnect != nil {
 				c.onCannotConnect(token)
 			}
@@ -357,11 +384,11 @@ func (c *Client) messageLoop() {
 		case ServerNetInfo:
 			parents, err := ParseNetInfo(msg)
 			if err != nil {
-				log.Printf("slsk: failed to parse net info: %v", err)
+				slog.Warn("failed to parse net info", "component", "slsk", "err", err)
 				continue
 			}
 			if c.distribMgr != nil && len(parents) > 0 {
-				log.Printf("slsk: received %d potential parents", len(parents))
+				slog.Debug("received potential parents", "component", "slsk", "count", len(parents))
 				c.distribMgr.HandleNetInfo(parents)
 			}
 
@@ -371,7 +398,7 @@ func (c *Client) messageLoop() {
 			// Known server messages we don't need to handle.
 
 		default:
-			log.Printf("slsk: unhandled server message code %d (%d bytes)", r.Code(), len(msg))
+			slog.Debug("unhandled server message", "component", "slsk", "code", r.Code(), "bytes", len(msg))
 		}
 	}
 }

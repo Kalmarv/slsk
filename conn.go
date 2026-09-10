@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 )
 
@@ -41,16 +42,20 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 		return nil, fmt.Errorf("message too large: %d bytes (max %d)", payloadLen, maxMessageSize)
 	}
 
-	// 4. Read exactly payloadLen bytes.
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(c.raw, payload); err != nil {
-		return nil, err
+	// 4. Read exactly payloadLen bytes, growing the buffer as data arrives so a
+	// peer that claims a large message but sends nothing cannot force a large
+	// upfront allocation.
+	const readChunk = 64 * 1024
+	total := 4 + int(payloadLen)
+	msg := make([]byte, 4, min(total, 4+readChunk))
+	copy(msg, lenBuf)
+	for len(msg) < total {
+		n := min(readChunk, total-len(msg))
+		msg = slices.Grow(msg, n)[:len(msg)+n]
+		if _, err := io.ReadFull(c.raw, msg[len(msg)-n:]); err != nil {
+			return nil, err
+		}
 	}
-
-	// 5. Return the full message: length prefix + payload.
-	msg := make([]byte, 4+payloadLen)
-	copy(msg[:4], lenBuf)
-	copy(msg[4:], payload)
 	return msg, nil
 }
 

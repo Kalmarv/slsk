@@ -73,15 +73,22 @@ func zlibCompress(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// maxDecompressedSize bounds zlib output so a small crafted message cannot
+// expand into gigabytes and kill the process (decompression bomb).
+const maxDecompressedSize = 128 << 20 // 128 MiB
+
 func zlibDecompress(data []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("zlib decompress init: %w", err)
 	}
 	defer r.Close()
-	out, err := io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, maxDecompressedSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("zlib decompress read: %w", err)
+	}
+	if len(out) > maxDecompressedSize {
+		return nil, fmt.Errorf("zlib decompress: output exceeds %d bytes", maxDecompressedSize)
 	}
 	return out, nil
 }
@@ -123,20 +130,21 @@ func readSharedFiles(r *MessageReader) ([]SharedFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read file count: %w", err)
 	}
-	files := make([]SharedFile, count)
-	for i := range files {
+	files := make([]SharedFile, 0, min(int(count), 256))
+	for i := uint32(0); i < count; i++ {
+		var f SharedFile
 		if _, err := r.ReadUint8(); err != nil { // file code
 			return nil, fmt.Errorf("file[%d] code: %w", i, err)
 		}
-		files[i].Filename, err = r.ReadString()
+		f.Filename, err = r.ReadString()
 		if err != nil {
 			return nil, fmt.Errorf("file[%d] filename: %w", i, err)
 		}
-		files[i].Size, err = r.ReadUint64()
+		f.Size, err = r.ReadUint64()
 		if err != nil {
 			return nil, fmt.Errorf("file[%d] size: %w", i, err)
 		}
-		files[i].Extension, err = r.ReadString()
+		f.Extension, err = r.ReadString()
 		if err != nil {
 			return nil, fmt.Errorf("file[%d] extension: %w", i, err)
 		}
@@ -144,17 +152,20 @@ func readSharedFiles(r *MessageReader) ([]SharedFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("file[%d] attr count: %w", i, err)
 		}
-		files[i].Attributes = make([]FileAttribute, attrCount)
-		for j := range files[i].Attributes {
-			files[i].Attributes[j].Type, err = r.ReadUint32()
+		f.Attributes = make([]FileAttribute, 0, min(int(attrCount), 16))
+		for j := uint32(0); j < attrCount; j++ {
+			var a FileAttribute
+			a.Type, err = r.ReadUint32()
 			if err != nil {
 				return nil, fmt.Errorf("file[%d] attr[%d] type: %w", i, j, err)
 			}
-			files[i].Attributes[j].Value, err = r.ReadUint32()
+			a.Value, err = r.ReadUint32()
 			if err != nil {
 				return nil, fmt.Errorf("file[%d] attr[%d] value: %w", i, j, err)
 			}
+			f.Attributes = append(f.Attributes, a)
 		}
+		files = append(files, f)
 	}
 	return files, nil
 }

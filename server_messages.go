@@ -370,11 +370,16 @@ func ParseWatchUserResponse(msg []byte) (*WatchUserResponse, error) {
 	}
 	resp.AvgSpeed = avgSpeed
 
-	uploadNum, err := r.ReadUint64()
+	uploadNum, err := r.ReadUint32()
 	if err != nil {
 		return nil, fmt.Errorf("parse watch user: read uploadnum: %w", err)
 	}
-	resp.UploadNum = uploadNum
+	resp.UploadNum = uint64(uploadNum)
+
+	// Reserved/unknown uint32 that follows uploadnum on the wire.
+	if _, err := r.ReadUint32(); err != nil {
+		return nil, fmt.Errorf("parse watch user: read reserved: %w", err)
+	}
 
 	files, err := r.ReadUint32()
 	if err != nil {
@@ -501,7 +506,7 @@ func ParseNetInfo(msg []byte) ([]PotentialParent, error) {
 		return nil, fmt.Errorf("parse net info: read count: %w", err)
 	}
 
-	parents := make([]PotentialParent, 0, count)
+	parents := make([]PotentialParent, 0, min(int(count), 16))
 	for i := uint32(0); i < count; i++ {
 		username, err := r.ReadString()
 		if err != nil {

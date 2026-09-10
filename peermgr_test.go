@@ -18,7 +18,7 @@ func newTestPeerManager(username string) *PeerManager {
 	return &PeerManager{
 		username:      username,
 		pendingTokens: make(map[uint32]chan connectResult),
-		pendingAddrs:  make(map[string][]chan *PeerAddressResponse),
+		pendingAddrs:  make(map[string][]chan addrResult),
 		msgHandlers:   make(map[uint32]PeerMessageHandler),
 	}
 }
@@ -799,14 +799,69 @@ func TestPeerManager_CannotConnect_FailsFast(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// getPeerAddress failure propagation
+// ---------------------------------------------------------------------------
+
+func TestGetPeerAddressFailsFastForAllWaiters(t *testing.T) {
+	// A client that is not logged in makes every GetPeerAddress request fail
+	// immediately, which is exactly the "request write failed" path.
+	c, err := NewClient(ClientConfig{ServerAddr: "127.0.0.1:1", Username: "u", Password: "p"})
+	require.NoError(t, err)
+	pm := NewPeerManager("u", c)
+
+	const n = 3
+	errs := make(chan error, n)
+	var started sync.WaitGroup
+	started.Add(n)
+	for range n {
+		go func() {
+			started.Done()
+			_, err := pm.getPeerAddress(context.Background(), "peerx")
+			errs <- err
+		}()
+	}
+	started.Wait()
+
+	for range n {
+		select {
+		case err := <-errs:
+			assert.Error(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("waiter hung instead of failing fast")
+		}
+	}
+
+	pm.mu.Lock()
+	_, exists := pm.pendingAddrs["peerx"]
+	pm.mu.Unlock()
+	assert.False(t, exists, "no waiters should be left behind")
+}
+
+func TestCountedConnReleasesOnce(t *testing.T) {
+	pm := newTestPeerManager("u")
+	pm.conns = 1
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	cc := &countedConn{Conn: c2, release: pm.releaseConn}
+
+	require.NoError(t, cc.Close())
+	require.NoError(t, cc.Close()) // double close must not double-release
+	assert.Equal(t, 0, pm.conns)
+
+	pm.releaseConn() // must not go negative
+	assert.Equal(t, 0, pm.conns)
+}
+
+// ---------------------------------------------------------------------------
 // pendingAddrs cleanup test
 // ---------------------------------------------------------------------------
 
 func TestPeerManager_RemoveAddrWaiter(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	ch1 := make(chan *PeerAddressResponse, 1)
-	ch2 := make(chan *PeerAddressResponse, 1)
+	ch1 := make(chan addrResult, 1)
+	ch2 := make(chan addrResult, 1)
 
 	pm.mu.Lock()
 	pm.pendingAddrs["user1"] = append(pm.pendingAddrs["user1"], ch1)
