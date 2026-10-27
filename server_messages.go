@@ -545,3 +545,28 @@ func ParseCannotConnect(msg []byte) (uint32, error) {
 	}
 	return token, nil
 }
+
+// ParseExcludedSearchPhrases parses an ExcludedSearchPhrases message (code 160),
+// sent after login. The server drops searches containing any of these phrases.
+// Wire format: [uint32 count][for each: string phrase]
+func ParseExcludedSearchPhrases(msg []byte) ([]string, error) {
+	r, err := NewReader(msg)
+	if err != nil {
+		return nil, fmt.Errorf("parse excluded phrases: %w", err)
+	}
+
+	count, err := r.ReadUint32()
+	if err != nil {
+		return nil, fmt.Errorf("parse excluded phrases: read count: %w", err)
+	}
+
+	phrases := make([]string, 0, min(int(count), 1024))
+	for i := uint32(0); i < count; i++ {
+		phrase, err := r.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("parse excluded phrases: phrase[%d]: %w", i, err)
+		}
+		phrases = append(phrases, phrase)
+	}
+	return phrases, nil
+}

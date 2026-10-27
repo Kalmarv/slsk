@@ -38,6 +38,8 @@ type Client struct {
 	onCannotConnect func(token uint32)
 
 	distribMgr *DistribManager
+
+	excludedPhrases atomic.Pointer[[]string] // from the server's ExcludedSearchPhrases
 }
 
 // NewClient creates a new Client with the given configuration, applying
@@ -286,6 +288,15 @@ func (c *Client) SetDistribManager(dm *DistribManager) {
 	}
 }
 
+// ExcludedSearchPhrases returns the phrases the server drops
+// searches for, as last sent by the server (nil before the first login).
+func (c *Client) ExcludedSearchPhrases() []string {
+	if p := c.excludedPhrases.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // messageLoop reads messages from the server in a loop and dispatches
 // them by code. It runs in a goroutine, owns conn for reads, and closes done
 // when the connection drops.
@@ -394,8 +405,17 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 
 		case ServerCheckPrivileges, ServerRoomList, ServerPrivilegedUsers,
 			ServerParentMinSpeed, ServerParentSpeedRatio,
-			ServerWishlistInterval, ServerExcludedPhrases:
+			ServerWishlistInterval:
 			// Known server messages we don't need to handle.
+
+		case ServerExcludedPhrases:
+			phrases, err := ParseExcludedSearchPhrases(msg)
+			if err != nil {
+				slog.Warn("failed to parse excluded search phrases", "component", "slsk", "err", err)
+				continue
+			}
+			c.excludedPhrases.Store(&phrases)
+			slog.Info("received excluded search phrases", "component", "slsk", "count", len(phrases))
 
 		default:
 			slog.Debug("unhandled server message", "component", "slsk", "code", r.Code(), "bytes", len(msg))

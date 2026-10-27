@@ -457,6 +457,11 @@ func ParsePlaceInQueueResponse(msg []byte) (*PlaceInQueue, error) {
 // Upload Denied (code 50)
 // ---------------------------------------------------------------------------
 
+// DenyFileNotShared is the standard UploadDenied reason for a file we don't
+// share. Clients match it exactly and stop retrying; any other reason is
+// treated as temporary and the download is requested again.
+const DenyFileNotShared = "File not shared."
+
 // BuildUploadDenied builds an upload denied message (code 50).
 func BuildUploadDenied(filename, reason string) []byte {
 	b := NewBuilder(PeerUploadDenied)
