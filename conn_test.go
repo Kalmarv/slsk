@@ -1,11 +1,14 @@
 package slsk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // helper: start a TCP server on a random port, return the listener
@@ -294,5 +297,61 @@ func TestConn_RemoteAddr(t *testing.T) {
 	}
 	if addr.String() != ln.Addr().String() {
 		t.Fatalf("RemoteAddr = %s, want %s", addr.String(), ln.Addr().String())
+	}
+}
+
+func TestWrapPeerConn_RejectsMessagesOverPeerLimit(t *testing.T) {
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, maxPeerMessageSize+1)
+
+	c := WrapPeerConn(&streamConn{r: bytes.NewReader(lenBuf)})
+	if _, err := c.ReadMessage(); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("peer conn: err = %v, want message too large", err)
+	}
+
+	// The same length is acceptable on the server connection (it fails later
+	// on EOF, not on the size check).
+	s := WrapConn(&streamConn{r: bytes.NewReader(lenBuf)})
+	if _, err := s.ReadMessage(); err == nil || strings.Contains(err.Error(), "too large") {
+		t.Fatalf("server conn: err = %v, want read error", err)
+	}
+}
+
+// A peer that never drains its socket must not block WriteMessage forever.
+func TestConn_WriteMessageTimesOut(t *testing.T) {
+	a, b := net.Pipe() // unbuffered: Write blocks until b reads
+	defer a.Close()
+	defer b.Close()
+	c := WrapPeerConn(a)
+	c.writeTimeout = 50 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- c.WriteMessage(BuildQueueDownload("x")) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a timeout error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteMessage blocked past its write deadline")
+	}
+}
+
+// The write deadline must not outlive the write: a later raw write by the
+// owner of the connection (file transfers) is unaffected.
+func TestConn_WriteMessageClearsDeadline(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	c := WrapPeerConn(a)
+	c.writeTimeout = 50 * time.Millisecond
+
+	go io.Copy(io.Discard, b)
+	if err := c.WriteMessage(BuildQueueDownload("x")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, err := c.Raw().Write([]byte("raw")); err != nil {
+		t.Fatalf("raw write after WriteMessage: %v", err)
 	}
 }

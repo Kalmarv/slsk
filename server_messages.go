@@ -546,6 +546,16 @@ func ParseCannotConnect(msg []byte) (uint32, error) {
 	return token, nil
 }
 
+// BuildCantConnectToPeer builds a CantConnectToPeer message (code 1001) telling
+// the server we could not fulfil its ConnectToPeer request with this token, so
+// it can fail the other side's attempt at once instead of timing out.
+func BuildCantConnectToPeer(token uint32, username string) []byte {
+	b := NewBuilder(ServerCannotConnect)
+	b.WriteUint32(token)
+	b.WriteString(username)
+	return b.Build()
+}
+
 // ParseExcludedSearchPhrases parses an ExcludedSearchPhrases message (code 160),
 // sent after login. The server drops searches containing any of these phrases.
 // Wire format: [uint32 count][for each: string phrase]

@@ -2,6 +2,7 @@ package slsk
 
 import (
 	"encoding/binary"
+	"runtime"
 	"testing"
 )
 
@@ -659,5 +660,115 @@ func TestParsePlaceInQueueRequest(t *testing.T) {
 	}
 	if filename != `Music\Artist\track.mp3` {
 		t.Errorf("filename = %q", filename)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hostile search responses
+// ---------------------------------------------------------------------------
+
+// searchResponseWire wraps an uncompressed payload in a code-9 message.
+func searchResponseWire(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	z, err := zlibCompress(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := NewBuilder(PeerSearchResponse)
+	b.WriteBytes(z)
+	return b.Build()
+}
+
+func searchPayload(count uint32, tail ...byte) []byte {
+	b := NewBuilder(0)
+	b.WriteString("u")
+	b.WriteUint32(7)
+	b.WriteUint32(count)
+	b.WriteBytes(tail)
+	return b.Build()[8:]
+}
+
+func TestParseSearchResponse_RejectsCountLargerThanPayload(t *testing.T) {
+	msg := searchResponseWire(t, searchPayload(0xffffffff, make([]byte, 100)...))
+	if _, err := ParseSearchResponse(msg); err == nil {
+		t.Fatal("expected error for file count exceeding the payload")
+	}
+}
+
+func TestParseSearchResponse_RejectsAttrCountLargerThanPayload(t *testing.T) {
+	b := NewBuilder(0)
+	b.WriteUint8(1)
+	b.WriteString("a")
+	b.WriteUint64(1)
+	b.WriteString("mp3")
+	b.WriteUint32(0xffffffff) // attribute count
+	msg := searchResponseWire(t, searchPayload(1, b.Build()[8:]...))
+	if _, err := ParseSearchResponse(msg); err == nil {
+		t.Fatal("expected error for attribute count exceeding the payload")
+	}
+}
+
+func TestParseSearchResponse_RejectsOversizedPayload(t *testing.T) {
+	msg := searchResponseWire(t, make([]byte, maxSearchResponseSize+1))
+	if _, err := ParseSearchResponse(msg); err == nil {
+		t.Fatal("expected error for decompressed payload over the cap")
+	}
+}
+
+// A bomb of empty files compresses ~1000:1 (6,000,000 files fit in ~122 KB on
+// the wire). Both the header read and the full parse must stay cheap; 1,000,000
+// files (21 MB decompressed) show the same thing without a slow test.
+func TestParseSearchResponse_BombIsCheap(t *testing.T) {
+	const files = 1_000_000
+	payload := append(searchPayload(files), make([]byte, files*minSharedFileSize)...)
+	msg := searchResponseWire(t, payload)
+	if len(msg) > 50<<10 {
+		t.Fatalf("test bomb is %d bytes on the wire, want under 50 KB", len(msg))
+	}
+
+	alloc := func(f func()) uint64 {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		f()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	var hdr *SearchResponseHeader
+	if n := alloc(func() { hdr, _ = ParseSearchResponseHeader(msg) }); n > 256<<10 {
+		t.Errorf("header parse allocated %d bytes", n)
+	}
+	if hdr == nil || hdr.Username != "u" || hdr.Token != 7 {
+		t.Errorf("header = %+v, want u/7", hdr)
+	}
+	var err error
+	if n := alloc(func() { _, err = ParseSearchResponse(msg) }); n > 8*maxSearchResponseSize {
+		t.Errorf("full parse allocated %d bytes", n)
+	}
+	if err == nil {
+		t.Error("expected the bomb to be rejected")
+	}
+}
+
+func TestParseSearchResponseHeader(t *testing.T) {
+	msg, err := BuildSearchResponse(SearchResponse{Username: "alice", Token: 42, Files: []SharedFile{{Filename: "a", Extension: "mp3"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, err := ParseSearchResponseHeader(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Username != "alice" || hdr.Token != 42 {
+		t.Errorf("header = %+v", hdr)
+	}
+
+	long := searchResponseWire(t, append([]byte{0xff, 0xff, 0, 0}, make([]byte, 10)...))
+	if _, err := ParseSearchResponseHeader(long); err == nil {
+		t.Error("expected error for oversized username length")
+	}
+	if _, err := ParseSearchResponseHeader(BuildQueueDownload("x")); err == nil {
+		t.Error("expected error for wrong code")
 	}
 }

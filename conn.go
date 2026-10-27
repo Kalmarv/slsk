@@ -6,22 +6,41 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"time"
 )
 
-// maxMessageSize is the largest payload we accept (100 MB).
-// Messages claiming a larger size are rejected as corrupt or malicious.
-const maxMessageSize = 100 * 1024 * 1024 // 100 MB
+// Largest payloads we accept. Messages claiming a larger size are rejected as
+// corrupt or malicious. The server sends big lists (rooms, privileged users);
+// peers only send small control messages and compressed search responses
+// (mantis never requests a browse), so their limit is much lower.
+const (
+	maxMessageSize     = 100 * 1024 * 1024 // server connection
+	maxPeerMessageSize = 4 * 1024 * 1024   // peer, transfer and distributed connections
+)
 
 // Conn wraps a net.Conn with Soulseek message framing.
 // Every message on the wire is prefixed with a 4-byte little-endian length.
 type Conn struct {
-	raw net.Conn
-	mu  sync.Mutex // protects writes
+	raw          net.Conn
+	maxSize      uint32        // largest payload ReadMessage accepts
+	writeTimeout time.Duration // bound on one WriteMessage
+	mu           sync.Mutex    // protects writes
 }
 
-// WrapConn wraps an existing net.Conn with Soulseek message framing.
+// writeTimeout is how long one framed write may block. Control messages are
+// small, so a peer that does not drain its socket for this long is gone; without
+// a bound it would hold the write lock (and the calling goroutine) forever.
+const writeTimeout = 30 * time.Second
+
+// WrapConn wraps an existing server net.Conn with Soulseek message framing.
 func WrapConn(c net.Conn) *Conn {
-	return &Conn{raw: c}
+	return &Conn{raw: c, maxSize: maxMessageSize, writeTimeout: writeTimeout}
+}
+
+// WrapPeerConn is WrapConn for connections to other peers, which accept only
+// small messages.
+func WrapPeerConn(c net.Conn) *Conn {
+	return &Conn{raw: c, maxSize: maxPeerMessageSize, writeTimeout: writeTimeout}
 }
 
 // ReadMessage reads a single framed message from the connection.
@@ -38,8 +57,8 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 	payloadLen := le.Uint32(lenBuf)
 
 	// 3. Sanity check: reject oversized messages.
-	if payloadLen > maxMessageSize {
-		return nil, fmt.Errorf("message too large: %d bytes (max %d)", payloadLen, maxMessageSize)
+	if payloadLen > c.maxSize {
+		return nil, fmt.Errorf("message too large: %d bytes (max %d)", payloadLen, c.maxSize)
 	}
 
 	// 4. Read exactly payloadLen bytes, growing the buffer as data arrives so a
@@ -61,12 +80,20 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 
 // WriteMessage writes a complete framed message to the connection.
 // The msg must already include the 4-byte length prefix (as returned by Build()).
+// A write that does not complete within writeTimeout fails; the connection is
+// then in an undefined framing state and should be closed.
 // WriteMessage is safe for concurrent use.
 func (c *Conn) WriteMessage(msg []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.raw.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+		return err
+	}
 	_, err := c.raw.Write(msg)
+	// Clear the deadline so raw writes by the owner (file transfers) are not
+	// cut off by a stale one.
+	_ = c.raw.SetWriteDeadline(time.Time{})
 	return err
 }
 

@@ -18,6 +18,7 @@ import (
 // messages. Each is called on the same fuzzed input; only panics fail.
 var messageParsers = map[string]func([]byte){
 	"SearchResponse":          func(b []byte) { _, _ = ParseSearchResponse(b) },
+	"SearchResponseHeader":    func(b []byte) { _, _ = ParseSearchResponseHeader(b) },
 	"TransferRequest":         func(b []byte) { _, _ = ParseTransferRequest(b) },
 	"TransferResponse":        func(b []byte) { _, _ = ParseTransferResponse(b) },
 	"QueueDownload":           func(b []byte) { _, _ = ParseQueueDownload(b) },
@@ -136,7 +137,7 @@ func FuzzSearchResponsePayload(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	payload, err := zlibDecompress(sr[8:])
+	payload, err := zlibDecompress(sr[8:], maxSearchResponseSize)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -150,7 +151,19 @@ func FuzzSearchResponsePayload(f *testing.F) {
 		_ = w.Close()
 		b := NewBuilder(PeerSearchResponse)
 		b.WriteBytes(buf.Bytes())
-		_, _ = ParseSearchResponse(b.Build())
+		resp, err := ParseSearchResponse(b.Build())
+		if err != nil {
+			return
+		}
+		// Work is bounded by input size: every parsed entry consumed bytes.
+		if got := len(resp.Files) + len(resp.LockedFiles); got > len(payload)/minSharedFileSize {
+			t.Fatalf("parsed %d files from a %d byte payload", got, len(payload))
+		}
+		for _, f := range append(resp.Files, resp.LockedFiles...) {
+			if len(f.Attributes) > len(payload)/fileAttributeSize {
+				t.Fatalf("parsed %d attributes from a %d byte payload", len(f.Attributes), len(payload))
+			}
+		}
 	})
 }
 

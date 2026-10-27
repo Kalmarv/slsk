@@ -3,6 +3,7 @@ package slsk
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -50,6 +51,10 @@ const (
 	// maxPeerConns caps concurrent inbound peer connections so a peer flood
 	// cannot exhaust file descriptors and goroutines.
 	maxPeerConns = 1000
+	// directConnectTimeout bounds the direct dial of an outgoing connection;
+	// the indirect leg runs concurrently and has indirectConnectTimeout.
+	directConnectTimeout   = 5 * time.Second
+	indirectConnectTimeout = 15 * time.Second
 	// peerIdleTimeout closes P-type connections that go quiet. Transfers run on
 	// separate F connections, so this only reclaims abandoned signaling links.
 	peerIdleTimeout = 15 * time.Minute
@@ -67,9 +72,19 @@ type PeerManager struct {
 	pendingAddrs  map[string][]chan addrResult  // username -> waiters for address
 	msgHandlers   map[uint32]PeerMessageHandler // message code -> handler
 	conns         int                           // open inbound peer connections
+	listening     bool                          // listener bound and accepting
+	listenErr     string                        // last bind failure, "" once bound
 
 	onFileConn PeerHandler // called for incoming F connections
+
+	// dial opens direct outgoing connections; nil means a plain net.Dialer.
+	// Tests replace it.
+	dial func(ctx context.Context, addr string) (net.Conn, error)
 }
+
+// ErrPeerOffline is returned when the server reports no address for a peer
+// (0.0.0.0:0), which it does for users that are offline.
+var ErrPeerOffline = errors.New("peer is offline")
 
 // NewPeerManager creates a new PeerManager with the given username and client.
 // It registers for ConnectToPeer server messages to handle indirect peer connections
@@ -136,13 +151,18 @@ func (pm *PeerManager) OnFileConnection(fn PeerHandler) {
 	pm.onFileConn = fn
 }
 
-// Listen starts accepting incoming peer connections on the given port.
-func (pm *PeerManager) Listen(ctx context.Context, port int) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+// Listen accepts incoming peer connections on the given port until ctx is
+// cancelled. If the port cannot be bound (still held by a previous process,
+// say) it keeps retrying with backoff rather than leaving inbound connections
+// silently dead; ListenStatus reports the state.
+func (pm *PeerManager) Listen(ctx context.Context, port int) {
+	ln := pm.bind(ctx, port)
+	if ln == nil {
+		return // cancelled while waiting to bind
 	}
+	pm.mu.Lock()
 	pm.listener = ln
+	pm.mu.Unlock()
 
 	go func() {
 		<-ctx.Done()
@@ -153,14 +173,14 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) error {
 		raw, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // context cancelled, clean shutdown
+				return // context cancelled, clean shutdown
 			}
 			slog.Error("peer accept error", "component", "peermgr", "err", err)
 			// Back off so a persistent error (e.g. fd exhaustion) cannot spin
 			// the accept loop at 100% CPU.
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-time.After(time.Second):
 			}
 			continue
@@ -178,6 +198,48 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) error {
 
 		go pm.handleIncoming(&countedConn{Conn: raw, release: pm.releaseConn})
 	}
+}
+
+// Bind retry schedule for Listen.
+const (
+	bindRetryInitial = time.Second
+	bindRetryMax     = 30 * time.Second
+)
+
+// bind opens the listening socket, retrying until it succeeds or ctx ends (in
+// which case it returns nil).
+func (pm *PeerManager) bind(ctx context.Context, port int) net.Listener {
+	delay := bindRetryInitial
+	for {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			pm.setListenState(true, "")
+			slog.Info("peer listener started", "component", "peermgr", "port", port)
+			return ln
+		}
+		pm.setListenState(false, err.Error())
+		slog.Error("peer listener cannot bind, will retry", "component", "peermgr", "port", port, "err", err, "retryIn", delay)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, bindRetryMax)
+	}
+}
+
+func (pm *PeerManager) setListenState(listening bool, errMsg string) {
+	pm.mu.Lock()
+	pm.listening, pm.listenErr = listening, errMsg
+	pm.mu.Unlock()
+}
+
+// ListenStatus reports whether the peer listener is accepting connections
+// and, if not, why the last bind attempt failed.
+func (pm *PeerManager) ListenStatus() (listening bool, lastErr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.listening, pm.listenErr
 }
 
 // countedConn releases a peer connection slot exactly once, on Close.
@@ -204,7 +266,7 @@ func (pm *PeerManager) releaseConn() {
 
 // handleIncoming reads the init message from an incoming connection.
 func (pm *PeerManager) handleIncoming(raw net.Conn) {
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Set a deadline for the handshake.
 	raw.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -288,8 +350,17 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 	conn.Close()
 }
 
-// ConnectToPeer establishes a peer connection, trying direct first then indirect.
-// Returns a connected PeerConn ready for message exchange.
+// ConnectToPeer establishes a peer connection by dialing the peer and, at the
+// same time, asking the server to make the peer connect back to us; the first
+// connection to succeed wins and the other is closed. It fails fast with
+// ErrPeerOffline if the server has no address for the peer.
+//
+// Connections of type "P" are owned by the PeerManager from the moment they
+// are returned: every message the peer sends on them is dispatched to the
+// handlers registered with OnPeerMessage, exactly as on connections the peer
+// opened to us. Callers must only write to a P connection (and may Close it
+// when done) and must not read from it; replies arrive at the handlers. "F"
+// connections carry raw file data and stay owned by the caller.
 func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
 	return pm.ConnectToPeerWithToken(ctx, username, connType, generateToken())
 }
@@ -304,36 +375,130 @@ func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username stri
 	if err != nil {
 		return nil, err
 	}
-
 	if !isValidAddr(addr) {
-		slog.Debug("invalid address, trying indirect", "component", "peermgr", "user", username, "ip", addr.IP, "port", addr.Port)
-	} else {
-		directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
-		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
-		directCancel()
-		if err == nil {
-			return pc, nil
-		}
+		return nil, fmt.Errorf("connect to %s: %w", username, ErrPeerOffline)
 	}
 
-	pc, err := pm.connectIndirect(ctx, username, connType, token)
+	pc, err := pm.connectRacing(ctx, addr, username, connType, token)
 	if err != nil {
 		return nil, err
 	}
+	if connType == ConnTypePeer {
+		go pm.routePeerMessages(pc)
+	}
 	return pc, nil
+}
+
+// connectRacing runs the direct dial and the indirect (server-relayed)
+// request concurrently and returns the first connection that is established.
+// The token is registered before either leg starts so a PierceFirewall that
+// arrives early cannot be missed. The losing leg is cancelled and any
+// connection it produced is closed.
+func (pm *PeerManager) connectRacing(ctx context.Context, addr *PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
+	indirect := pm.registerToken(token)
+	defer pm.unregisterToken(token, indirect)
+
+	directCtx, cancelDirect := context.WithTimeout(ctx, directConnectTimeout)
+	defer cancelDirect()
+	directDone := make(chan connectResult, 1)
+	go func() {
+		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
+		directDone <- connectResult{pc: pc, err: err}
+	}()
+	direct := directDone // nil once consumed
+	// Whatever the direct leg produces after we return is closed.
+	defer func() {
+		if direct == nil {
+			return
+		}
+		cancelDirect()
+		go func() {
+			if res := <-directDone; res.pc != nil {
+				res.pc.Conn.Close()
+			}
+		}()
+	}()
+
+	var directErr, indirectErr error
+	if err := pm.client.SendConnectToPeer(token, username, connType); err != nil {
+		indirectErr = fmt.Errorf("send connect to peer: %w", err)
+		indirect = nil
+	}
+	timeout := time.NewTimer(indirectConnectTimeout)
+	defer timeout.Stop()
+
+	for direct != nil || indirect != nil {
+		select {
+		case res := <-direct:
+			direct = nil
+			if res.err == nil {
+				return res.pc, nil
+			}
+			directErr = res.err
+		case res := <-indirect:
+			indirect = nil
+			if res.err == nil {
+				res.pc.Username = username
+				res.pc.Type = connType
+				return res.pc, nil
+			}
+			indirectErr = res.err
+		case <-timeout.C:
+			indirect = nil
+			indirectErr = fmt.Errorf("timeout waiting for indirect connection from %s", username)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("connect to %s: %w", username, errors.Join(directErr, indirectErr))
+}
+
+// registerToken registers a pending indirect connection and returns the
+// channel its PierceFirewall (or a CannotConnect error) will be delivered on.
+func (pm *PeerManager) registerToken(token uint32) chan connectResult {
+	ch := make(chan connectResult, 1)
+	pm.mu.Lock()
+	pm.pendingTokens[token] = ch
+	pm.mu.Unlock()
+	return ch
+}
+
+// unregisterToken removes a pending token. A connection that arrived after
+// the waiter gave up is parked in ch; it is closed so its socket and
+// goroutine are not leaked.
+func (pm *PeerManager) unregisterToken(token uint32, ch chan connectResult) {
+	pm.mu.Lock()
+	delete(pm.pendingTokens, token)
+	var orphan *PeerConn
+	select {
+	case res := <-ch:
+		orphan = res.pc
+	default:
+	}
+	pm.mu.Unlock()
+	if orphan != nil {
+		orphan.Conn.Close()
+	}
+}
+
+func (pm *PeerManager) dialContext(ctx context.Context, addr string) (net.Conn, error) {
+	if pm.dial != nil {
+		return pm.dial(ctx, addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 // connectDirect dials the peer directly and sends PeerInit.
 func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
 	target := fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 
-	var d net.Dialer
-	raw, err := d.DialContext(ctx, "tcp", target)
+	raw, err := pm.dialContext(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", target, err)
 	}
 
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Send PeerInit.
 	initMsg := BuildPeerInit(pm.username, connType, token)
@@ -350,52 +515,6 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressRespo
 	}, nil
 }
 
-// connectIndirect asks the server to tell the peer to connect to us.
-func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType string, token uint32) (*PeerConn, error) {
-	// Register a pending token so we can match the incoming PierceFirewall.
-	ch := make(chan connectResult, 1)
-	pm.mu.Lock()
-	pm.pendingTokens[token] = ch
-	pm.mu.Unlock()
-
-	defer func() {
-		pm.mu.Lock()
-		delete(pm.pendingTokens, token)
-		// A connection that arrived after we gave up is parked in ch; close it
-		// so its socket and goroutine are not leaked.
-		var orphan *PeerConn
-		select {
-		case res := <-ch:
-			orphan = res.pc
-		default:
-		}
-		pm.mu.Unlock()
-		if orphan != nil {
-			orphan.Conn.Close()
-		}
-	}()
-
-	// Ask server to tell peer to connect to us.
-	if err := pm.client.SendConnectToPeer(token, username, connType); err != nil {
-		return nil, fmt.Errorf("send connect to peer: %w", err)
-	}
-
-	// Wait for the peer to connect back, or CannotConnect to fail fast.
-	select {
-	case result := <-ch:
-		if result.err != nil {
-			return nil, result.err
-		}
-		result.pc.Username = username
-		result.pc.Type = connType
-		return result.pc, nil
-	case <-time.After(15 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for indirect connection from %s", username)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 // handleConnectToPeer handles the server telling us that a peer wants us to
 // connect to them (reverse/indirect connection). We dial the peer and send
 // PierceFirewall with their token, then dispatch based on connection type.
@@ -404,7 +523,8 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	slog.Debug("ConnectToPeer request", "component", "peermgr", "user", resp.Username, "type", resp.Type, "addr", target, "token", resp.Token)
 
 	if resp.IP.IsUnspecified() || resp.Port == 0 {
-		slog.Debug("ignoring ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
+		slog.Debug("cannot honour ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
+		pm.reportCantConnect(resp)
 		return
 	}
 
@@ -415,16 +535,18 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	raw, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		slog.Debug("failed to connect to peer", "component", "peermgr", "user", resp.Username, "addr", target, "err", err)
+		pm.reportCantConnect(resp)
 		return
 	}
 
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Send PierceFirewall with the token from the server message.
 	pfMsg := BuildPierceFirewall(resp.Token)
 	if err := conn.WriteMessage(pfMsg); err != nil {
 		conn.Close()
 		slog.Debug("failed to send PierceFirewall", "component", "peermgr", "user", resp.Username, "err", err)
+		pm.reportCantConnect(resp)
 		return
 	}
 
@@ -446,6 +568,14 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 		}
 	default:
 		conn.Close()
+	}
+}
+
+// reportCantConnect tells the server an indirect connection it asked us to
+// make could not be made, so the peer that wanted it fails fast.
+func (pm *PeerManager) reportCantConnect(resp *ConnectToPeerResponse) {
+	if err := pm.client.SendCantConnectToPeer(resp.Token, resp.Username); err != nil {
+		slog.Debug("failed to send CantConnectToPeer", "component", "peermgr", "user", resp.Username, "err", err)
 	}
 }
 

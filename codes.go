@@ -8,6 +8,7 @@ const (
 	ServerWatchUser          uint32 = 5
 	ServerGetStatus          uint32 = 7
 	ServerConnectToPeer      uint32 = 18
+	ServerRelogged           uint32 = 41
 	ServerFileSearch         uint32 = 26
 	ServerSetStatus          uint32 = 28
 	ServerPing               uint32 = 32
