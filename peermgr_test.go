@@ -17,6 +17,7 @@ import (
 func newTestPeerManager(username string) *PeerManager {
 	return &PeerManager{
 		username:      username,
+		client:        &Client{}, // never logged in: server writes fail
 		pendingTokens: make(map[uint32]chan connectResult),
 		pendingAddrs:  make(map[string][]chan addrResult),
 		msgHandlers:   make(map[uint32]PeerMessageHandler),
@@ -883,4 +884,74 @@ func TestPeerManager_RemoveAddrWaiter(t *testing.T) {
 	_, exists := pm.pendingAddrs["user1"]
 	pm.mu.Unlock()
 	assert.False(t, exists, "key should be deleted when no waiters remain")
+}
+
+// ---------------------------------------------------------------------------
+// CantConnectToPeer
+// ---------------------------------------------------------------------------
+
+// readCantConnect returns the (token, username) of the next code-1001 message
+// the mock server receives.
+func readCantConnect(t *testing.T, sc *Conn) (uint32, string) {
+	t.Helper()
+	sc.Raw().SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		msg, err := sc.ReadMessage()
+		require.NoError(t, err, "no CantConnectToPeer reached the server")
+		r, err := NewReader(msg)
+		require.NoError(t, err)
+		if r.Code() != ServerCannotConnect {
+			continue
+		}
+		token, err := r.ReadUint32()
+		require.NoError(t, err)
+		user, err := r.ReadString()
+		require.NoError(t, err)
+		return token, user
+	}
+}
+
+func TestPeerManager_HandleConnectToPeer_ReportsCantConnect(t *testing.T) {
+	// A closed local port: the dial is refused immediately.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	closedPort := uint32(ln.Addr().(*net.TCPAddr).Port)
+	ln.Close()
+
+	cases := []struct {
+		name string
+		ip   string
+		port uint32
+	}{
+		{"dial failure", "127.0.0.1", closedPort},
+		{"invalid address", "0.0.0.0", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, serverSide := connectedClient(t)
+			sc := <-serverSide
+			defer sc.Close()
+			pm := newTestPeerManager("me")
+			pm.client = client
+
+			go pm.handleConnectToPeer(&ConnectToPeerResponse{
+				Username: "ghost", Type: ConnTypePeer, IP: net.ParseIP(tc.ip), Port: tc.port, Token: 4242,
+			})
+
+			token, user := readCantConnect(t, sc)
+			assert.Equal(t, uint32(4242), token)
+			assert.Equal(t, "ghost", user)
+		})
+	}
+}
+
+func TestBuildCantConnectToPeer(t *testing.T) {
+	r, err := NewReader(BuildCantConnectToPeer(7, "bob"))
+	require.NoError(t, err)
+	assert.Equal(t, ServerCannotConnect, r.Code())
+	token, _ := r.ReadUint32()
+	user, _ := r.ReadString()
+	assert.Equal(t, uint32(7), token)
+	assert.Equal(t, "bob", user)
+	assert.False(t, r.HasMore())
 }

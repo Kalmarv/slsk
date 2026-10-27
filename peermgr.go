@@ -404,7 +404,8 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	slog.Debug("ConnectToPeer request", "component", "peermgr", "user", resp.Username, "type", resp.Type, "addr", target, "token", resp.Token)
 
 	if resp.IP.IsUnspecified() || resp.Port == 0 {
-		slog.Debug("ignoring ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
+		slog.Debug("cannot honour ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
+		pm.reportCantConnect(resp)
 		return
 	}
 
@@ -415,6 +416,7 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	raw, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		slog.Debug("failed to connect to peer", "component", "peermgr", "user", resp.Username, "addr", target, "err", err)
+		pm.reportCantConnect(resp)
 		return
 	}
 
@@ -425,6 +427,7 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 	if err := conn.WriteMessage(pfMsg); err != nil {
 		conn.Close()
 		slog.Debug("failed to send PierceFirewall", "component", "peermgr", "user", resp.Username, "err", err)
+		pm.reportCantConnect(resp)
 		return
 	}
 
@@ -446,6 +449,14 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 		}
 	default:
 		conn.Close()
+	}
+}
+
+// reportCantConnect tells the server an indirect connection it asked us to
+// make could not be made, so the peer that wanted it fails fast.
+func (pm *PeerManager) reportCantConnect(resp *ConnectToPeerResponse) {
+	if err := pm.client.SendCantConnectToPeer(resp.Token, resp.Username); err != nil {
+		slog.Debug("failed to send CantConnectToPeer", "component", "peermgr", "user", resp.Username, "err", err)
 	}
 }
 

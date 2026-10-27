@@ -250,6 +250,12 @@ func (c *Client) SendConnectToPeer(token uint32, username, connType string) erro
 	return c.write(BuildConnectToPeerRequest(token, username, connType))
 }
 
+// SendCantConnectToPeer tells the server we could not connect to the peer of
+// an indirect ConnectToPeer request it relayed to us.
+func (c *Client) SendCantConnectToPeer(token uint32, username string) error {
+	return c.write(BuildCantConnectToPeer(token, username))
+}
+
 // SendSharedFoldersFiles reports share counts to the server.
 func (c *Client) SendSharedFoldersFiles(dirs, files uint32) error {
 	return c.write(BuildSharedFoldersFiles(dirs, files))
