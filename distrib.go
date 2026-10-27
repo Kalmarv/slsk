@@ -84,7 +84,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 		return false
 	}
 
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Send PeerInit with type "D" and token 0.
 	initMsg := BuildPeerInit(dm.username, ConnTypeDistributed, 0)

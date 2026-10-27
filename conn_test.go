@@ -1,9 +1,11 @@
 package slsk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -294,5 +296,22 @@ func TestConn_RemoteAddr(t *testing.T) {
 	}
 	if addr.String() != ln.Addr().String() {
 		t.Fatalf("RemoteAddr = %s, want %s", addr.String(), ln.Addr().String())
+	}
+}
+
+func TestWrapPeerConn_RejectsMessagesOverPeerLimit(t *testing.T) {
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, maxPeerMessageSize+1)
+
+	c := WrapPeerConn(&streamConn{r: bytes.NewReader(lenBuf)})
+	if _, err := c.ReadMessage(); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("peer conn: err = %v, want message too large", err)
+	}
+
+	// The same length is acceptable on the server connection (it fails later
+	// on EOF, not on the size check).
+	s := WrapConn(&streamConn{r: bytes.NewReader(lenBuf)})
+	if _, err := s.ReadMessage(); err == nil || strings.Contains(err.Error(), "too large") {
+		t.Fatalf("server conn: err = %v, want read error", err)
 	}
 }

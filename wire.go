@@ -97,6 +97,10 @@ func (r *MessageReader) Code() uint32 { return r.code }
 // HasMore returns true if there are unread bytes remaining.
 func (r *MessageReader) HasMore() bool { return r.pos < len(r.data) }
 
+// Remaining returns the number of unread bytes. Parsers use it to reject
+// element counts that cannot fit in what is left of the message.
+func (r *MessageReader) Remaining() int { return len(r.data) - r.pos }
+
 func (r *MessageReader) ReadUint8() (uint8, error) {
 	if r.pos+1 > len(r.data) {
 		return 0, fmt.Errorf("read uint8: need 1 byte, have %d", len(r.data)-r.pos)

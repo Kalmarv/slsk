@@ -8,20 +8,32 @@ import (
 	"sync"
 )
 
-// maxMessageSize is the largest payload we accept (100 MB).
-// Messages claiming a larger size are rejected as corrupt or malicious.
-const maxMessageSize = 100 * 1024 * 1024 // 100 MB
+// Largest payloads we accept. Messages claiming a larger size are rejected as
+// corrupt or malicious. The server sends big lists (rooms, privileged users);
+// peers only send small control messages and compressed search responses
+// (mantis never requests a browse), so their limit is much lower.
+const (
+	maxMessageSize     = 100 * 1024 * 1024 // server connection
+	maxPeerMessageSize = 4 * 1024 * 1024   // peer, transfer and distributed connections
+)
 
 // Conn wraps a net.Conn with Soulseek message framing.
 // Every message on the wire is prefixed with a 4-byte little-endian length.
 type Conn struct {
-	raw net.Conn
-	mu  sync.Mutex // protects writes
+	raw     net.Conn
+	maxSize uint32     // largest payload ReadMessage accepts
+	mu      sync.Mutex // protects writes
 }
 
-// WrapConn wraps an existing net.Conn with Soulseek message framing.
+// WrapConn wraps an existing server net.Conn with Soulseek message framing.
 func WrapConn(c net.Conn) *Conn {
-	return &Conn{raw: c}
+	return &Conn{raw: c, maxSize: maxMessageSize}
+}
+
+// WrapPeerConn is WrapConn for connections to other peers, which accept only
+// small messages.
+func WrapPeerConn(c net.Conn) *Conn {
+	return &Conn{raw: c, maxSize: maxPeerMessageSize}
 }
 
 // ReadMessage reads a single framed message from the connection.
@@ -38,8 +50,8 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 	payloadLen := le.Uint32(lenBuf)
 
 	// 3. Sanity check: reject oversized messages.
-	if payloadLen > maxMessageSize {
-		return nil, fmt.Errorf("message too large: %d bytes (max %d)", payloadLen, maxMessageSize)
+	if payloadLen > c.maxSize {
+		return nil, fmt.Errorf("message too large: %d bytes (max %d)", payloadLen, c.maxSize)
 	}
 
 	// 4. Read exactly payloadLen bytes, growing the buffer as data arrives so a

@@ -73,22 +73,28 @@ func zlibCompress(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// maxDecompressedSize bounds zlib output so a small crafted message cannot
-// expand into gigabytes and kill the process (decompression bomb).
-const maxDecompressedSize = 128 << 20 // 128 MiB
+// maxSearchResponseSize bounds the decompressed payload of a search response.
+// A response is a few hundred bytes per file, so 4 MiB covers tens of
+// thousands of files while keeping a crafted message from expanding into
+// gigabytes (decompression bomb).
+const maxSearchResponseSize = 4 << 20
 
-func zlibDecompress(data []byte) ([]byte, error) {
+// maxUsernameLen bounds the username read from a search response header;
+// Soulseek usernames are far shorter.
+const maxUsernameLen = 1024
+
+func zlibDecompress(data []byte, limit int) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("zlib decompress init: %w", err)
 	}
 	defer r.Close()
-	out, err := io.ReadAll(io.LimitReader(r, maxDecompressedSize+1))
+	out, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil {
 		return nil, fmt.Errorf("zlib decompress read: %w", err)
 	}
-	if len(out) > maxDecompressedSize {
-		return nil, fmt.Errorf("zlib decompress: output exceeds %d bytes", maxDecompressedSize)
+	if len(out) > limit {
+		return nil, fmt.Errorf("zlib decompress: output exceeds %d bytes", limit)
 	}
 	return out, nil
 }
@@ -125,10 +131,21 @@ func writeSharedFiles(b *MessageBuilder, files []SharedFile) {
 	}
 }
 
+// Smallest encodings of a file entry (code, empty filename, size, empty
+// extension, attribute count) and of one attribute. A count that would not fit
+// in the unread bytes at these sizes is corrupt or hostile.
+const (
+	minSharedFileSize = 1 + 4 + 8 + 4 + 4
+	fileAttributeSize = 4 + 4
+)
+
 func readSharedFiles(r *MessageReader) ([]SharedFile, error) {
 	count, err := r.ReadUint32()
 	if err != nil {
 		return nil, fmt.Errorf("read file count: %w", err)
+	}
+	if int64(count) > int64(r.Remaining()/minSharedFileSize) {
+		return nil, fmt.Errorf("file count %d exceeds %d bytes remaining", count, r.Remaining())
 	}
 	files := make([]SharedFile, 0, min(int(count), 256))
 	for i := uint32(0); i < count; i++ {
@@ -151,6 +168,9 @@ func readSharedFiles(r *MessageReader) ([]SharedFile, error) {
 		attrCount, err := r.ReadUint32()
 		if err != nil {
 			return nil, fmt.Errorf("file[%d] attr count: %w", i, err)
+		}
+		if int64(attrCount) > int64(r.Remaining()/fileAttributeSize) {
+			return nil, fmt.Errorf("file[%d] attr count %d exceeds %d bytes remaining", i, attrCount, r.Remaining())
 		}
 		f.Attributes = make([]FileAttribute, 0, min(int(attrCount), 16))
 		for j := uint32(0); j < attrCount; j++ {
@@ -202,18 +222,62 @@ func BuildSearchResponse(resp SearchResponse) ([]byte, error) {
 	return outer.Build(), nil
 }
 
-// ParseSearchResponse parses a peer search response message (code 9).
-func ParseSearchResponse(msg []byte) (*SearchResponse, error) {
+// SearchResponseHeader identifies the sender and search of a search response.
+type SearchResponseHeader struct {
+	Username string
+	Token    uint32
+}
+
+// ParseSearchResponseHeader reads only the username and token of a search
+// response (code 9), decompressing no more than the first few bytes. Callers
+// use it to drop responses for searches they are not running before paying to
+// decompress and parse the file lists.
+func ParseSearchResponseHeader(msg []byte) (*SearchResponseHeader, error) {
+	if err := checkSearchResponseFrame(msg); err != nil {
+		return nil, err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(msg[8:]))
+	if err != nil {
+		return nil, fmt.Errorf("search response decompress: %w", err)
+	}
+	defer zr.Close()
+
+	var n [4]byte
+	if _, err := io.ReadFull(zr, n[:]); err != nil {
+		return nil, fmt.Errorf("search response username: %w", err)
+	}
+	nameLen := le.Uint32(n[:])
+	if nameLen > maxUsernameLen {
+		return nil, fmt.Errorf("search response username: length %d exceeds %d", nameLen, maxUsernameLen)
+	}
+	buf := make([]byte, nameLen+4)
+	if _, err := io.ReadFull(zr, buf); err != nil {
+		return nil, fmt.Errorf("search response token: %w", err)
+	}
+	return &SearchResponseHeader{
+		Username: string(buf[:nameLen]),
+		Token:    le.Uint32(buf[nameLen:]),
+	}, nil
+}
+
+func checkSearchResponseFrame(msg []byte) error {
 	if len(msg) < 8 {
-		return nil, fmt.Errorf("search response too short: %d bytes", len(msg))
+		return fmt.Errorf("search response too short: %d bytes", len(msg))
+	}
+	if code := le.Uint32(msg[4:8]); code != PeerSearchResponse {
+		return fmt.Errorf("expected code %d, got %d", PeerSearchResponse, code)
+	}
+	return nil
+}
+
+// ParseSearchResponse parses a peer search response message (code 9). The
+// decompressed payload is capped at maxSearchResponseSize.
+func ParseSearchResponse(msg []byte) (*SearchResponse, error) {
+	if err := checkSearchResponseFrame(msg); err != nil {
+		return nil, err
 	}
 
-	code := le.Uint32(msg[4:8])
-	if code != PeerSearchResponse {
-		return nil, fmt.Errorf("expected code %d, got %d", PeerSearchResponse, code)
-	}
-
-	decompressed, err := zlibDecompress(msg[8:])
+	decompressed, err := zlibDecompress(msg[8:], maxSearchResponseSize)
 	if err != nil {
 		return nil, fmt.Errorf("search response decompress: %w", err)
 	}

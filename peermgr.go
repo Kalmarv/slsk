@@ -204,7 +204,7 @@ func (pm *PeerManager) releaseConn() {
 
 // handleIncoming reads the init message from an incoming connection.
 func (pm *PeerManager) handleIncoming(raw net.Conn) {
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Set a deadline for the handshake.
 	raw.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -333,7 +333,7 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressRespo
 		return nil, fmt.Errorf("dial %s: %w", target, err)
 	}
 
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Send PeerInit.
 	initMsg := BuildPeerInit(pm.username, connType, token)
@@ -418,7 +418,7 @@ func (pm *PeerManager) handleConnectToPeer(resp *ConnectToPeerResponse) {
 		return
 	}
 
-	conn := WrapConn(raw)
+	conn := WrapPeerConn(raw)
 
 	// Send PierceFirewall with the token from the server message.
 	pfMsg := BuildPierceFirewall(resp.Token)
