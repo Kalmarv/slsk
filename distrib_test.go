@@ -1,8 +1,10 @@
 package slsk
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -353,4 +355,177 @@ func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
 	}
 
 	dm.Close()
+}
+
+// distribUpdates collects the server messages that describe the distributed
+// state (HaveNoParent, BranchRoot, BranchLevel) as readable strings.
+type distribUpdates struct {
+	ch chan string
+}
+
+func describeDistribMsg(msg []byte) string {
+	r, err := NewReader(msg)
+	if err != nil {
+		return ""
+	}
+	switch r.Code() {
+	case ServerHaveNoParent:
+		v, _ := r.ReadBool()
+		return fmt.Sprintf("HaveNoParent=%v", v)
+	case ServerBranchRoot:
+		v, _ := r.ReadString()
+		return "BranchRoot=" + v
+	case ServerBranchLevel:
+		v, _ := r.ReadUint32()
+		return fmt.Sprintf("BranchLevel=%d", v)
+	}
+	return ""
+}
+
+// loginWithDistrib logs a client with the given manager into a mock server and
+// returns the distributed-state messages the server saw, in order.
+func loginWithDistrib(t *testing.T, dm *DistribManager) (*Client, *distribUpdates) {
+	t.Helper()
+	u := &distribUpdates{ch: make(chan string, 64)}
+	addr := startMockServer(t, func(sc *Conn) {
+		handleLogin(t, sc, buildLoginSuccessResponse())
+		for {
+			msg, err := sc.ReadMessage()
+			if err != nil {
+				return
+			}
+			if s := describeDistribMsg(msg); s != "" {
+				u.ch <- s
+			}
+		}
+	})
+	c, err := NewClient(ClientConfig{ServerAddr: addr, Username: "me", Password: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dm != nil {
+		c.SetDistribManager(dm)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c, u
+}
+
+func (u *distribUpdates) expect(t *testing.T, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		select {
+		case got := <-u.ch:
+			if got != w {
+				t.Fatalf("server saw %q, want %q", got, w)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %q", w)
+		}
+	}
+}
+
+func TestClient_LoginWithoutParentReportsNoParent(t *testing.T) {
+	dm := NewDistribManager("me", nil)
+	_, u := loginWithDistrib(t, dm)
+	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
+}
+
+// The manager keeps its parent when the server connection drops, so the next
+// login must report that parent instead of claiming to have none.
+func TestClient_LoginResyncsExistingParent(t *testing.T) {
+	dm := NewDistribManager("me", nil)
+	dm.hasParent, dm.branchLvl, dm.branchRoot = true, 3, "root"
+	_, u := loginWithDistrib(t, dm)
+	u.expect(t, "HaveNoParent=false", "BranchRoot=root", "BranchLevel=3")
+}
+
+// Branch level/root changes announced by the parent are forwarded to the server.
+func TestClient_ForwardsParentBranchChanges(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	update := make(chan struct{})
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn := WrapConn(raw)
+		conn.ReadMessage() // PeerInit
+		conn.WriteMessage(BuildDistribBranchLevel(0))
+		conn.WriteMessage(BuildDistribBranchRoot("root"))
+		b := NewInitBuilder(DistribSearchRequest)
+		b.WriteUint32(distribSearchIdentifier)
+		b.WriteString("s")
+		b.WriteUint32(1)
+		b.WriteString("q")
+		conn.WriteMessage(b.Build())
+		<-update
+		conn.WriteMessage(BuildDistribBranchLevel(4))
+		conn.WriteMessage(BuildDistribBranchRoot("newroot"))
+		for {
+			if _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	dm := NewDistribManager("me", func(*IncomingSearchRequest) {})
+	_, u := loginWithDistrib(t, dm)
+	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	var port uint32
+	fmt.Sscanf(portStr, "%d", &port)
+	dm.HandleNetInfo([]PotentialParent{{Username: "root", IP: net.ParseIP(host).To4(), Port: port}})
+
+	u.expect(t, "HaveNoParent=false", "BranchRoot=root", "BranchLevel=1")
+	close(update)
+	u.expect(t, "HaveNoParent=false", "BranchRoot=root", "BranchLevel=5")
+	u.expect(t, "HaveNoParent=false", "BranchRoot=newroot", "BranchLevel=5")
+	dm.Close()
+}
+
+// Concurrent state changes must not be reordered on the wire: whatever the
+// interleaving, the last state the server hears is the manager's final state.
+func TestClient_ConcurrentParentChangesEndInFinalState(t *testing.T) {
+	dm := NewDistribManager("me", nil)
+	_, u := loginWithDistrib(t, dm)
+	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
+
+	var wg sync.WaitGroup
+	for i := 1; i <= 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			dm.mu.Lock()
+			dm.hasParent, dm.branchLvl, dm.branchRoot = true, uint32(i), fmt.Sprintf("root%d", i)
+			dm.mu.Unlock()
+			dm.changed()
+		}(i)
+	}
+	wg.Wait()
+	final := dm.State()
+	want := []string{"HaveNoParent=false", "BranchRoot=" + final.BranchRoot, fmt.Sprintf("BranchLevel=%d", final.BranchLevel)}
+
+	var last []string
+	deadline := time.After(2 * time.Second)
+	for len(last) < 3 || last[0] != want[0] || last[1] != want[1] || last[2] != want[2] {
+		select {
+		case s := <-u.ch:
+			last = append(last, s)
+			if len(last) > 3 {
+				last = last[1:]
+			}
+		case <-deadline:
+			t.Fatalf("server's last state %v, want %v", last, want)
+		}
+	}
 }

@@ -39,6 +39,7 @@ type Client struct {
 	onCannotConnect func(token uint32)
 
 	distribMgr *DistribManager
+	distribMu  sync.Mutex // serializes distributed-state updates to the server
 
 	excludedPhrases atomic.Pointer[[]string] // from the server's ExcludedSearchPhrases
 }
@@ -172,23 +173,24 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.loggedIn.Store(true)
 
 	// Post-login initialization: matches soul/Nicotine+ sequence.
+	write := func(msg []byte) func() error { return func() error { return conn.WriteMessage(msg) } }
 	initMsgs := []struct {
 		name string
-		data []byte
+		send func() error
 	}{
-		{"CheckPrivileges", BuildCheckPrivileges()},
-		{"SetListenPort", BuildSetListenPort(c.cfg.ListenPort)},
-		{"SetStatus", BuildSetStatus(2)},
-		{"HaveNoParent", BuildHaveNoParent(true)},
-		{"BranchRoot", BuildBranchRoot(c.cfg.Username)},
-		{"BranchLevel", BuildBranchLevel(0)},
+		{"CheckPrivileges", write(BuildCheckPrivileges())},
+		{"SetListenPort", write(BuildSetListenPort(c.cfg.ListenPort))},
+		{"SetStatus", write(BuildSetStatus(2))},
+		// The distributed manager keeps its parent across server reconnects,
+		// so report its actual state rather than "no parent".
+		{"DistribState", c.syncDistrib},
 		// We do not implement the child side of the distributed tree, so do
 		// not advertise that we accept children (the server would otherwise
 		// assign us peers we immediately reject).
-		{"AcceptChildren", BuildAcceptChildren(false)},
+		{"AcceptChildren", write(BuildAcceptChildren(false))},
 	}
 	for _, m := range initMsgs {
-		if err := conn.WriteMessage(m.data); err != nil {
+		if err := m.send(); err != nil {
 			c.loggedIn.Store(false)
 			conn.Close()
 			return fmt.Errorf("send %s: %w", m.name, err)
@@ -293,24 +295,42 @@ func (c *Client) OnCannotConnect(fn func(token uint32)) {
 }
 
 // SetDistribManager sets the distributed network manager. When set, the client
-// will parse NetInfo (code 102) messages and pass them to the manager. The manager's
-// OnParentChange callback is wired to send HaveNoParent/BranchLevel/BranchRoot
-// updates back to the server.
+// will parse NetInfo (code 102) messages and pass them to the manager, and keep
+// the server informed of the manager's parent, branch level and branch root
+// (on login and whenever they change).
 func (c *Client) SetDistribManager(dm *DistribManager) {
 	c.distribMgr = dm
-	dm.OnParentChange = func(hasParent bool, branchLevel uint32, branchRoot string) {
-		// Tell server whether we have a parent.
-		if err := c.write(BuildHaveNoParent(!hasParent)); err != nil {
-			slog.Error("send HaveNoParent", "component", "slsk", "err", err)
+	dm.OnChange = func() {
+		if err := c.syncDistrib(); err != nil && !errors.Is(err, errNotLoggedIn) {
+			slog.Error("send distributed state", "component", "slsk", "err", err)
 		}
-		if err := c.write(BuildBranchLevel(branchLevel)); err != nil {
-			slog.Error("send BranchLevel", "component", "slsk", "err", err)
-		}
-		if err := c.write(BuildBranchRoot(branchRoot)); err != nil {
-			slog.Error("send BranchRoot", "component", "slsk", "err", err)
-		}
-		slog.Debug("distrib state update", "component", "slsk", "hasParent", hasParent, "level", branchLevel, "root", branchRoot)
 	}
+}
+
+// syncDistrib tells the server our current place in the distributed tree
+// (HaveNoParent, BranchRoot, BranchLevel). The state is read under distribMu,
+// so racing updates are sent in the order their state was read and the last
+// message always reflects the latest state. Errors while logged out are
+// expected: Connect re-sends the state after each login.
+func (c *Client) syncDistrib() error {
+	c.distribMu.Lock()
+	defer c.distribMu.Unlock()
+
+	st := DistribState{BranchRoot: c.cfg.Username}
+	if c.distribMgr != nil {
+		st = c.distribMgr.State()
+	}
+	for _, m := range [][]byte{
+		BuildHaveNoParent(!st.HasParent),
+		BuildBranchRoot(st.BranchRoot),
+		BuildBranchLevel(st.BranchLevel),
+	} {
+		if err := c.write(m); err != nil {
+			return err
+		}
+	}
+	slog.Debug("distrib state sent", "component", "slsk", "hasParent", st.HasParent, "level", st.BranchLevel, "root", st.BranchRoot)
+	return nil
 }
 
 // ExcludedSearchPhrases returns the phrases the server drops

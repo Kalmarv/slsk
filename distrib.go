@@ -25,10 +25,35 @@ type DistribManager struct {
 	hasParent  bool
 	closed     bool
 
-	// OnParentChange is called when the parent state changes.
-	// hasParent=true means we adopted a parent; false means we lost it.
-	// The caller should send HaveNoParent(!hasParent), BranchLevel, BranchRoot to the server.
-	OnParentChange func(hasParent bool, branchLevel uint32, branchRoot string)
+	// OnChange is called after the distributed state changes: a parent was
+	// adopted or lost, or the parent reported a new branch level or root. It
+	// carries no state; the callee reads State(), so concurrent changes
+	// cannot be applied out of order. It is invoked with no locks held.
+	OnChange func()
+}
+
+// DistribState is a consistent snapshot of what the server must be told about
+// our place in the distributed tree.
+type DistribState struct {
+	HasParent   bool
+	BranchLevel uint32 // 0 without a parent
+	BranchRoot  string // our own username without a parent
+}
+
+// State returns the current distributed state.
+func (dm *DistribManager) State() DistribState {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if !dm.hasParent {
+		return DistribState{BranchRoot: dm.username}
+	}
+	return DistribState{HasParent: true, BranchLevel: dm.branchLvl, BranchRoot: dm.branchRoot}
+}
+
+func (dm *DistribManager) changed() {
+	if dm.OnChange != nil {
+		dm.OnChange()
+	}
 }
 
 // NewDistribManager creates a new DistribManager.
@@ -157,9 +182,7 @@ func (dm *DistribManager) tryOneParent(p PotentialParent) bool {
 
 			slog.Info("adopted parent", "component", "distrib", "user", p.Username, "level", level, "root", root)
 
-			if dm.OnParentChange != nil {
-				dm.OnParentChange(true, level+1, root)
-			}
+			dm.changed()
 
 			// Deliver the first search that triggered adoption.
 			search, err := ParseDistribSearchRequest(msg)
@@ -188,9 +211,7 @@ func (dm *DistribManager) readLoop(conn *Conn, parentUsername string) {
 
 		slog.Info("parent disconnected", "component", "distrib", "user", parentUsername)
 
-		if dm.OnParentChange != nil {
-			dm.OnParentChange(false, 0, dm.username)
-		}
+		dm.changed()
 	}()
 
 	for {
@@ -220,16 +241,24 @@ func (dm *DistribManager) readLoop(conn *Conn, parentUsername string) {
 			level, err := ParseDistribBranchLevel(msg)
 			if err == nil {
 				dm.mu.Lock()
+				updated := dm.branchLvl != level+1
 				dm.branchLvl = level + 1
 				dm.mu.Unlock()
+				if updated {
+					dm.changed()
+				}
 			}
 
 		case DistribBranchRoot:
 			root, err := ParseDistribBranchRoot(msg)
 			if err == nil {
 				dm.mu.Lock()
+				updated := dm.branchRoot != root
 				dm.branchRoot = root
 				dm.mu.Unlock()
+				if updated {
+					dm.changed()
+				}
 			}
 		}
 	}
