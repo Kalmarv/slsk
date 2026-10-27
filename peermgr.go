@@ -3,6 +3,7 @@ package slsk
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -50,6 +51,10 @@ const (
 	// maxPeerConns caps concurrent inbound peer connections so a peer flood
 	// cannot exhaust file descriptors and goroutines.
 	maxPeerConns = 1000
+	// directConnectTimeout bounds the direct dial of an outgoing connection;
+	// the indirect leg runs concurrently and has indirectConnectTimeout.
+	directConnectTimeout   = 5 * time.Second
+	indirectConnectTimeout = 15 * time.Second
 	// peerIdleTimeout closes P-type connections that go quiet. Transfers run on
 	// separate F connections, so this only reclaims abandoned signaling links.
 	peerIdleTimeout = 15 * time.Minute
@@ -69,7 +74,15 @@ type PeerManager struct {
 	conns         int                           // open inbound peer connections
 
 	onFileConn PeerHandler // called for incoming F connections
+
+	// dial opens direct outgoing connections; nil means a plain net.Dialer.
+	// Tests replace it.
+	dial func(ctx context.Context, addr string) (net.Conn, error)
 }
+
+// ErrPeerOffline is returned when the server reports no address for a peer
+// (0.0.0.0:0), which it does for users that are offline.
+var ErrPeerOffline = errors.New("peer is offline")
 
 // NewPeerManager creates a new PeerManager with the given username and client.
 // It registers for ConnectToPeer server messages to handle indirect peer connections
@@ -288,8 +301,17 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 	conn.Close()
 }
 
-// ConnectToPeer establishes a peer connection, trying direct first then indirect.
-// Returns a connected PeerConn ready for message exchange.
+// ConnectToPeer establishes a peer connection by dialing the peer and, at the
+// same time, asking the server to make the peer connect back to us; the first
+// connection to succeed wins and the other is closed. It fails fast with
+// ErrPeerOffline if the server has no address for the peer.
+//
+// Connections of type "P" are owned by the PeerManager from the moment they
+// are returned: every message the peer sends on them is dispatched to the
+// handlers registered with OnPeerMessage, exactly as on connections the peer
+// opened to us. Callers must only write to a P connection (and may Close it
+// when done) and must not read from it; replies arrive at the handlers. "F"
+// connections carry raw file data and stay owned by the caller.
 func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
 	return pm.ConnectToPeerWithToken(ctx, username, connType, generateToken())
 }
@@ -304,31 +326,125 @@ func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username stri
 	if err != nil {
 		return nil, err
 	}
-
 	if !isValidAddr(addr) {
-		slog.Debug("invalid address, trying indirect", "component", "peermgr", "user", username, "ip", addr.IP, "port", addr.Port)
-	} else {
-		directCtx, directCancel := context.WithTimeout(ctx, 5*time.Second)
-		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
-		directCancel()
-		if err == nil {
-			return pc, nil
-		}
+		return nil, fmt.Errorf("connect to %s: %w", username, ErrPeerOffline)
 	}
 
-	pc, err := pm.connectIndirect(ctx, username, connType, token)
+	pc, err := pm.connectRacing(ctx, addr, username, connType, token)
 	if err != nil {
 		return nil, err
 	}
+	if connType == ConnTypePeer {
+		go pm.routePeerMessages(pc)
+	}
 	return pc, nil
+}
+
+// connectRacing runs the direct dial and the indirect (server-relayed)
+// request concurrently and returns the first connection that is established.
+// The token is registered before either leg starts so a PierceFirewall that
+// arrives early cannot be missed. The losing leg is cancelled and any
+// connection it produced is closed.
+func (pm *PeerManager) connectRacing(ctx context.Context, addr *PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
+	indirect := pm.registerToken(token)
+	defer pm.unregisterToken(token, indirect)
+
+	directCtx, cancelDirect := context.WithTimeout(ctx, directConnectTimeout)
+	defer cancelDirect()
+	directDone := make(chan connectResult, 1)
+	go func() {
+		pc, err := pm.connectDirect(directCtx, addr, username, connType, token)
+		directDone <- connectResult{pc: pc, err: err}
+	}()
+	direct := directDone // nil once consumed
+	// Whatever the direct leg produces after we return is closed.
+	defer func() {
+		if direct == nil {
+			return
+		}
+		cancelDirect()
+		go func() {
+			if res := <-directDone; res.pc != nil {
+				res.pc.Conn.Close()
+			}
+		}()
+	}()
+
+	var directErr, indirectErr error
+	if err := pm.client.SendConnectToPeer(token, username, connType); err != nil {
+		indirectErr = fmt.Errorf("send connect to peer: %w", err)
+		indirect = nil
+	}
+	timeout := time.NewTimer(indirectConnectTimeout)
+	defer timeout.Stop()
+
+	for direct != nil || indirect != nil {
+		select {
+		case res := <-direct:
+			direct = nil
+			if res.err == nil {
+				return res.pc, nil
+			}
+			directErr = res.err
+		case res := <-indirect:
+			indirect = nil
+			if res.err == nil {
+				res.pc.Username = username
+				res.pc.Type = connType
+				return res.pc, nil
+			}
+			indirectErr = res.err
+		case <-timeout.C:
+			indirect = nil
+			indirectErr = fmt.Errorf("timeout waiting for indirect connection from %s", username)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("connect to %s: %w", username, errors.Join(directErr, indirectErr))
+}
+
+// registerToken registers a pending indirect connection and returns the
+// channel its PierceFirewall (or a CannotConnect error) will be delivered on.
+func (pm *PeerManager) registerToken(token uint32) chan connectResult {
+	ch := make(chan connectResult, 1)
+	pm.mu.Lock()
+	pm.pendingTokens[token] = ch
+	pm.mu.Unlock()
+	return ch
+}
+
+// unregisterToken removes a pending token. A connection that arrived after
+// the waiter gave up is parked in ch; it is closed so its socket and
+// goroutine are not leaked.
+func (pm *PeerManager) unregisterToken(token uint32, ch chan connectResult) {
+	pm.mu.Lock()
+	delete(pm.pendingTokens, token)
+	var orphan *PeerConn
+	select {
+	case res := <-ch:
+		orphan = res.pc
+	default:
+	}
+	pm.mu.Unlock()
+	if orphan != nil {
+		orphan.Conn.Close()
+	}
+}
+
+func (pm *PeerManager) dialContext(ctx context.Context, addr string) (net.Conn, error) {
+	if pm.dial != nil {
+		return pm.dial(ctx, addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
 }
 
 // connectDirect dials the peer directly and sends PeerInit.
 func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
 	target := fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 
-	var d net.Dialer
-	raw, err := d.DialContext(ctx, "tcp", target)
+	raw, err := pm.dialContext(ctx, target)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", target, err)
 	}
@@ -348,52 +464,6 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *PeerAddressRespo
 		Type:     connType,
 		Token:    token,
 	}, nil
-}
-
-// connectIndirect asks the server to tell the peer to connect to us.
-func (pm *PeerManager) connectIndirect(ctx context.Context, username, connType string, token uint32) (*PeerConn, error) {
-	// Register a pending token so we can match the incoming PierceFirewall.
-	ch := make(chan connectResult, 1)
-	pm.mu.Lock()
-	pm.pendingTokens[token] = ch
-	pm.mu.Unlock()
-
-	defer func() {
-		pm.mu.Lock()
-		delete(pm.pendingTokens, token)
-		// A connection that arrived after we gave up is parked in ch; close it
-		// so its socket and goroutine are not leaked.
-		var orphan *PeerConn
-		select {
-		case res := <-ch:
-			orphan = res.pc
-		default:
-		}
-		pm.mu.Unlock()
-		if orphan != nil {
-			orphan.Conn.Close()
-		}
-	}()
-
-	// Ask server to tell peer to connect to us.
-	if err := pm.client.SendConnectToPeer(token, username, connType); err != nil {
-		return nil, fmt.Errorf("send connect to peer: %w", err)
-	}
-
-	// Wait for the peer to connect back, or CannotConnect to fail fast.
-	select {
-	case result := <-ch:
-		if result.err != nil {
-			return nil, result.err
-		}
-		result.pc.Username = username
-		result.pc.Type = connType
-		return result.pc, nil
-	case <-time.After(15 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for indirect connection from %s", username)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 }
 
 // handleConnectToPeer handles the server telling us that a peer wants us to
