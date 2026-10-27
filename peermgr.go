@@ -72,6 +72,8 @@ type PeerManager struct {
 	pendingAddrs  map[string][]chan addrResult  // username -> waiters for address
 	msgHandlers   map[uint32]PeerMessageHandler // message code -> handler
 	conns         int                           // open inbound peer connections
+	listening     bool                          // listener bound and accepting
+	listenErr     string                        // last bind failure, "" once bound
 
 	onFileConn PeerHandler // called for incoming F connections
 
@@ -149,13 +151,18 @@ func (pm *PeerManager) OnFileConnection(fn PeerHandler) {
 	pm.onFileConn = fn
 }
 
-// Listen starts accepting incoming peer connections on the given port.
-func (pm *PeerManager) Listen(ctx context.Context, port int) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+// Listen accepts incoming peer connections on the given port until ctx is
+// cancelled. If the port cannot be bound (still held by a previous process,
+// say) it keeps retrying with backoff rather than leaving inbound connections
+// silently dead; ListenStatus reports the state.
+func (pm *PeerManager) Listen(ctx context.Context, port int) {
+	ln := pm.bind(ctx, port)
+	if ln == nil {
+		return // cancelled while waiting to bind
 	}
+	pm.mu.Lock()
 	pm.listener = ln
+	pm.mu.Unlock()
 
 	go func() {
 		<-ctx.Done()
@@ -166,14 +173,14 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) error {
 		raw, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // context cancelled, clean shutdown
+				return // context cancelled, clean shutdown
 			}
 			slog.Error("peer accept error", "component", "peermgr", "err", err)
 			// Back off so a persistent error (e.g. fd exhaustion) cannot spin
 			// the accept loop at 100% CPU.
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-time.After(time.Second):
 			}
 			continue
@@ -191,6 +198,48 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) error {
 
 		go pm.handleIncoming(&countedConn{Conn: raw, release: pm.releaseConn})
 	}
+}
+
+// Bind retry schedule for Listen.
+const (
+	bindRetryInitial = time.Second
+	bindRetryMax     = 30 * time.Second
+)
+
+// bind opens the listening socket, retrying until it succeeds or ctx ends (in
+// which case it returns nil).
+func (pm *PeerManager) bind(ctx context.Context, port int) net.Listener {
+	delay := bindRetryInitial
+	for {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			pm.setListenState(true, "")
+			slog.Info("peer listener started", "component", "peermgr", "port", port)
+			return ln
+		}
+		pm.setListenState(false, err.Error())
+		slog.Error("peer listener cannot bind, will retry", "component", "peermgr", "port", port, "err", err, "retryIn", delay)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, bindRetryMax)
+	}
+}
+
+func (pm *PeerManager) setListenState(listening bool, errMsg string) {
+	pm.mu.Lock()
+	pm.listening, pm.listenErr = listening, errMsg
+	pm.mu.Unlock()
+}
+
+// ListenStatus reports whether the peer listener is accepting connections
+// and, if not, why the last bind attempt failed.
+func (pm *PeerManager) ListenStatus() (listening bool, lastErr string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.listening, pm.listenErr
 }
 
 // countedConn releases a peer connection slot exactly once, on Close.

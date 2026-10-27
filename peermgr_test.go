@@ -1167,3 +1167,54 @@ func TestConnectToPeer_FileConnectionIsNotRouted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "rawbytes0123", string(buf[:n]))
 }
+
+// ---------------------------------------------------------------------------
+// Listener bind retry
+// ---------------------------------------------------------------------------
+
+func TestPeerManager_Listen_RetriesUntilPortFree(t *testing.T) {
+	// Hold a port so the first bind fails.
+	hold, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	port := hold.Addr().(*net.TCPAddr).Port
+
+	pm := newTestPeerManager("me")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pm.Listen(ctx, port)
+
+	require.Eventually(t, func() bool {
+		listening, lastErr := pm.ListenStatus()
+		return !listening && lastErr != ""
+	}, 2*time.Second, 10*time.Millisecond, "bind failure must be reported")
+
+	hold.Close()
+	require.Eventually(t, func() bool {
+		listening, lastErr := pm.ListenStatus()
+		return listening && lastErr == ""
+	}, 5*time.Second, 20*time.Millisecond, "listener must bind once the port is free")
+
+	// And it really accepts.
+	raw, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	raw.Close()
+}
+
+func TestPeerManager_Listen_StopsRetryingOnCancel(t *testing.T) {
+	hold, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer hold.Close()
+
+	pm := newTestPeerManager("me")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { pm.Listen(ctx, hold.Addr().(*net.TCPAddr).Port); close(done) }()
+	require.Eventually(t, func() bool { _, e := pm.ListenStatus(); return e != "" }, 2*time.Second, 10*time.Millisecond)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Listen kept retrying after cancellation")
+	}
+}
