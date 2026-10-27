@@ -28,9 +28,9 @@ func TestSearchResponseRoundTrip(t *testing.T) {
 				},
 			},
 			{
-				Filename:   "Music/Artist/Track2.flac",
-				Size:       31457280,
-				Extension:  "flac",
+				Filename:  "Music/Artist/Track2.flac",
+				Size:      31457280,
+				Extension: "flac",
 				Attributes: []FileAttribute{
 					{Type: AttrBitRate, Value: 1411},
 					{Type: AttrSampleRate, Value: 44100},
@@ -109,9 +109,9 @@ func TestSearchResponseWithLockedFiles(t *testing.T) {
 		},
 		LockedFiles: []SharedFile{
 			{
-				Filename:   "Private/premium.flac",
-				Size:       52428800,
-				Extension:  "flac",
+				Filename:  "Private/premium.flac",
+				Size:      52428800,
+				Extension: "flac",
 				Attributes: []FileAttribute{
 					{Type: AttrBitRate, Value: 1411},
 					{Type: AttrDuration, Value: 300},

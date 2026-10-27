@@ -337,7 +337,7 @@ func TestClient_OnSearchRequest(t *testing.T) {
 		// Send an incoming search request (code 93 = ServerEmbeddedMessage).
 		var payload []byte
 		payload = append(payload, byte(DistribSearchRequest)) // distrib code = 3
-		payload = append(payload, u32le(49)...)                // identifier
+		payload = append(payload, u32le(49)...)               // identifier
 		payload = appendStr(payload, "searchuser")
 		payload = append(payload, u32le(42)...) // token
 		payload = appendStr(payload, "pink floyd")

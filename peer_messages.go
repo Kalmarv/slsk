@@ -100,7 +100,7 @@ func newReaderFromPayload(payload []byte) *MessageReader {
 	// Build a synthetic wire message: [length][code=0][payload]
 	synth := make([]byte, 8+len(payload))
 	le.PutUint32(synth[0:4], uint32(4+len(payload))) // length = code + payload
-	le.PutUint32(synth[4:8], 0)                       // dummy code
+	le.PutUint32(synth[4:8], 0)                      // dummy code
 	copy(synth[8:], payload)
 	r, _ := NewReader(synth) // cannot fail — synth is always >= 8 bytes
 	return r

@@ -24,14 +24,14 @@ func u64le(v uint64) []byte {
 
 func TestBuilderReaderRoundTrip(t *testing.T) {
 	tests := []struct {
-		name    string
-		code    uint32
-		build   func(b *MessageBuilder)
-		verify  func(t *testing.T, r *MessageReader)
+		name   string
+		code   uint32
+		build  func(b *MessageBuilder)
+		verify func(t *testing.T, r *MessageReader)
 	}{
 		{
-			name: "empty payload",
-			code: ServerLogin,
+			name:  "empty payload",
+			code:  ServerLogin,
 			build: func(b *MessageBuilder) {},
 			verify: func(t *testing.T, r *MessageReader) {
 				if r.Code() != ServerLogin {
@@ -252,10 +252,10 @@ func TestBuilderWireFormat(t *testing.T) {
 	// length = 4 (code) + 4 (string len) + 2 (string data) = 10
 	// [10,0,0,0] [1,0,0,0] [2,0,0,0] [h,i]
 	expected := bytes.Join([][]byte{
-		u32le(10),       // length prefix
-		u32le(1),        // code = ServerLogin
-		u32le(2),        // string length
-		[]byte("hi"),    // string data
+		u32le(10),    // length prefix
+		u32le(1),     // code = ServerLogin
+		u32le(2),     // string length
+		[]byte("hi"), // string data
 	}, nil)
 
 	if !bytes.Equal(msg, expected) {
@@ -269,8 +269,8 @@ func TestBuilderEmptyPayloadWireFormat(t *testing.T) {
 
 	// length = 4 (code only)
 	expected := bytes.Join([][]byte{
-		u32le(4),        // length prefix
-		u32le(32),       // code = ServerPing
+		u32le(4),  // length prefix
+		u32le(32), // code = ServerPing
 	}, nil)
 
 	if !bytes.Equal(msg, expected) {
@@ -397,8 +397,8 @@ func TestInitBuilderReaderRoundTrip(t *testing.T) {
 		verify func(t *testing.T, r *InitMessageReader)
 	}{
 		{
-			name: "empty payload",
-			code: InitPierceFirewall,
+			name:  "empty payload",
+			code:  InitPierceFirewall,
 			build: func(b *InitMessageBuilder) {},
 			verify: func(t *testing.T, r *InitMessageReader) {
 				if r.Code() != InitPierceFirewall {
@@ -510,9 +510,9 @@ func TestInitBuilderWireFormat(t *testing.T) {
 	// length = 1 (code) + 4 (uint32) = 5
 	// [5,0,0,0] [0] [0x39,0x30,0x00,0x00]
 	expected := bytes.Join([][]byte{
-		u32le(5),        // length prefix
-		{0},             // code = InitPierceFirewall = 0
-		u32le(12345),    // token
+		u32le(5),     // length prefix
+		{0},          // code = InitPierceFirewall = 0
+		u32le(12345), // token
 	}, nil)
 
 	if !bytes.Equal(msg, expected) {

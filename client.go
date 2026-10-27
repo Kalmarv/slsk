@@ -31,11 +31,11 @@ type Client struct {
 	mu       sync.Mutex // protects conn and done
 
 	// Event callbacks
-	onSearchRequest  func(*IncomingSearchRequest)
-	onConnectToPeer  func(*ConnectToPeerResponse)
-	onPeerAddress    func(*PeerAddressResponse)
-	onUserStatus     func(*UserStatusResponse)
-	onCannotConnect  func(token uint32)
+	onSearchRequest func(*IncomingSearchRequest)
+	onConnectToPeer func(*ConnectToPeerResponse)
+	onPeerAddress   func(*PeerAddressResponse)
+	onUserStatus    func(*UserStatusResponse)
+	onCannotConnect func(token uint32)
 
 	distribMgr *DistribManager
 }
