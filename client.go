@@ -28,7 +28,8 @@ type Client struct {
 	conn     *Conn
 	done     chan struct{} // closed when the current connection's message loop exits
 	loggedIn atomic.Bool
-	mu       sync.Mutex // protects conn and done
+	mu       sync.Mutex // protects conn, done and lost
+	lost     error      // why the last connection ended; nil while connected
 
 	// Event callbacks
 	onSearchRequest func(*IncomingSearchRequest)
@@ -70,6 +71,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 var errNotLoggedIn = errors.New("not logged in")
 
+// ErrRelogged is the reason a connection ended when the server reported
+// (code 41) that another client logged in to the same account. Reconnecting
+// at once would just kick that client off in turn.
+var ErrRelogged = errors.New("logged in elsewhere (server sent Relogged)")
+
 // loginTimeout bounds the TCP dial plus login handshake.
 const loginTimeout = 30 * time.Second
 
@@ -97,6 +103,24 @@ func (c *Client) Done() <-chan struct{} {
 	return c.done
 }
 
+// DisconnectReason returns why the most recent connection ended: ErrRelogged,
+// or the read error that dropped it. It is nil while connected and before the
+// first connection.
+func (c *Client) DisconnectReason() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lost
+}
+
+// setLost records why the connection ended, keeping the first reason.
+func (c *Client) setLost(err error) {
+	c.mu.Lock()
+	if c.lost == nil {
+		c.lost = err
+	}
+	c.mu.Unlock()
+}
+
 // Connect dials the Soulseek server, performs login, and on success sends
 // SetListenPort and starts the background message loop.
 func (c *Client) Connect(ctx context.Context) error {
@@ -110,6 +134,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	conn := WrapConn(raw)
 	c.mu.Lock()
 	c.conn = conn
+	c.lost = nil
 	c.mu.Unlock()
 
 	// Bound the login handshake so a half-open connection cannot block the
@@ -307,6 +332,7 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 		if err != nil {
 			// Connection closed or error — exit the loop.
 			slog.Warn("slsk server connection lost", "component", "slsk", "err", err)
+			c.setLost(err)
 			c.loggedIn.Store(false)
 			_ = conn.Close()
 			return
@@ -325,6 +351,13 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 			if err := conn.WriteMessage(pong); err != nil {
 				slog.Error("failed to send pong", "component", "slsk", "err", err)
 			}
+
+		case ServerRelogged:
+			slog.Warn("slsk server reports another client logged in to this account", "component", "slsk")
+			c.setLost(ErrRelogged)
+			c.loggedIn.Store(false)
+			_ = conn.Close()
+			return
 
 		case ServerEmbeddedMessage:
 			// Incoming search request (code 93).

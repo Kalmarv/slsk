@@ -2,6 +2,7 @@ package slsk
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -509,5 +510,65 @@ func TestClient_Close(t *testing.T) {
 	// Subsequent operations should fail.
 	if err := client.Search(1, "test"); err == nil {
 		t.Fatal("expected Search to fail after Close")
+	}
+}
+
+// connectedClient logs a Client in to a mock server and hands the server side
+// of the connection to the test through the returned channel.
+func connectedClient(t *testing.T) (*Client, <-chan *Conn) {
+	t.Helper()
+	serverSide := make(chan *Conn, 1)
+	addr := startMockServer(t, func(sc *Conn) {
+		handleLogin(t, sc, buildLoginSuccessResponse())
+		drainInitMessages(sc)
+		serverSide <- sc
+	})
+	client, err := NewClient(ClientConfig{ServerAddr: addr, Username: "u", Password: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return client, serverSide
+}
+
+func TestClient_Relogged(t *testing.T) {
+	client, serverSide := connectedClient(t)
+	sc := <-serverSide
+	defer sc.Close()
+
+	if client.DisconnectReason() != nil {
+		t.Fatalf("DisconnectReason = %v while connected", client.DisconnectReason())
+	}
+	if err := sc.WriteMessage(NewBuilder(ServerRelogged).Build()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not drop the connection on Relogged")
+	}
+	if !errors.Is(client.DisconnectReason(), ErrRelogged) {
+		t.Fatalf("DisconnectReason = %v, want ErrRelogged", client.DisconnectReason())
+	}
+	if client.LoggedIn() {
+		t.Fatal("client still logged in after Relogged")
+	}
+}
+
+func TestClient_DisconnectReasonOnDrop(t *testing.T) {
+	client, serverSide := connectedClient(t)
+	(<-serverSide).Close()
+	select {
+	case <-client.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not notice the dropped connection")
+	}
+	if err := client.DisconnectReason(); err == nil || errors.Is(err, ErrRelogged) {
+		t.Fatalf("DisconnectReason = %v, want the read error", err)
 	}
 }
