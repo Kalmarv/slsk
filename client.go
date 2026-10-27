@@ -356,8 +356,12 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 	for {
 		msg, err := conn.ReadMessage()
 		if err != nil {
-			// Connection closed or error — exit the loop.
-			slog.Warn("slsk server connection lost", "component", "slsk", "err", err)
+			// net.ErrClosed means we closed it ourselves (Close, shutdown).
+			if errors.Is(err, net.ErrClosed) {
+				slog.Debug("slsk server connection closed", "component", "slsk")
+			} else {
+				slog.Warn("slsk server connection lost", "component", "slsk", "err", err)
+			}
 			c.setLost(err)
 			c.loggedIn.Store(false)
 			_ = conn.Close()
@@ -474,7 +478,7 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				continue
 			}
 			c.excludedPhrases.Store(&phrases)
-			slog.Info("received excluded search phrases", "component", "slsk", "count", len(phrases))
+			slog.Info("received excluded search phrases", "component", "slsk", "count", len(phrases), "phrases", phrases)
 
 		default:
 			slog.Debug("unhandled server message", "component", "slsk", "code", r.Code(), "bytes", len(msg))
