@@ -7,7 +7,7 @@ users and shares files with them. It needs nothing outside the standard library 
 go get github.com/kalmarv/slsk
 ```
 
-It was written for [Mantis](https://github.com/kalmarv/mantis), a self-hosted music client, and runs it in production.
+It was written for Mantis, a self-hosted music client, and runs it in production.
 
 ## Quick start
 
