@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/kalmarv/slsk/protocol"
 )
 
 // ClientConfig holds the configuration for connecting to the Soulseek server.
@@ -25,17 +27,17 @@ type ClientConfig struct {
 // message dispatch, and outgoing requests.
 type Client struct {
 	cfg      ClientConfig
-	conn     *Conn
+	conn     *protocol.Conn
 	done     chan struct{} // closed when the current connection's message loop exits
 	loggedIn atomic.Bool
 	mu       sync.Mutex // protects conn, done and lost
 	lost     error      // why the last connection ended; nil while connected
 
 	// Event callbacks
-	onSearchRequest func(*IncomingSearchRequest)
-	onConnectToPeer func(*ConnectToPeerResponse)
-	onPeerAddress   func(*PeerAddressResponse)
-	onUserStatus    func(*UserStatusResponse)
+	onSearchRequest func(*protocol.IncomingSearchRequest)
+	onConnectToPeer func(*protocol.ConnectToPeerResponse)
+	onPeerAddress   func(*protocol.PeerAddressResponse)
+	onUserStatus    func(*protocol.UserStatusResponse)
 	onCannotConnect func(token uint32)
 
 	distribMgr *DistribManager
@@ -132,7 +134,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("dial %s: %w", c.cfg.ServerAddr, err)
 	}
 
-	conn := WrapConn(raw)
+	conn := protocol.WrapConn(raw)
 	c.mu.Lock()
 	c.conn = conn
 	c.lost = nil
@@ -146,7 +148,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	// Send login request.
-	loginMsg := BuildLoginRequest(c.cfg.Username, c.cfg.Password, c.cfg.MajorVersion, c.cfg.MinorVersion)
+	loginMsg := protocol.BuildLoginRequest(c.cfg.Username, c.cfg.Password, c.cfg.MajorVersion, c.cfg.MinorVersion)
 	if err := conn.WriteMessage(loginMsg); err != nil {
 		conn.Close()
 		return fmt.Errorf("send login: %w", err)
@@ -159,7 +161,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("read login response: %w", err)
 	}
 
-	resp, err := ParseLoginResponse(respMsg)
+	resp, err := protocol.ParseLoginResponse(respMsg)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("parse login response: %w", err)
@@ -178,16 +180,16 @@ func (c *Client) Connect(ctx context.Context) error {
 		name string
 		send func() error
 	}{
-		{"CheckPrivileges", write(BuildCheckPrivileges())},
-		{"SetListenPort", write(BuildSetListenPort(c.cfg.ListenPort))},
-		{"SetStatus", write(BuildSetStatus(2))},
+		{"CheckPrivileges", write(protocol.BuildCheckPrivileges())},
+		{"SetListenPort", write(protocol.BuildSetListenPort(c.cfg.ListenPort))},
+		{"SetStatus", write(protocol.BuildSetStatus(2))},
 		// The distributed manager keeps its parent across server reconnects,
 		// so report its actual state rather than "no parent".
 		{"DistribState", c.syncDistrib},
 		// We do not implement the child side of the distributed tree, so do
 		// not advertise that we accept children (the server would otherwise
 		// assign us peers we immediately reject).
-		{"AcceptChildren", write(BuildAcceptChildren(false))},
+		{"AcceptChildren", write(protocol.BuildAcceptChildren(false))},
 	}
 	for _, m := range initMsgs {
 		if err := m.send(); err != nil {
@@ -237,59 +239,59 @@ func (c *Client) ListenPort() uint32 {
 
 // Search sends a file search request to the server.
 func (c *Client) Search(token uint32, query string) error {
-	return c.write(BuildFileSearchRequest(token, query))
+	return c.write(protocol.BuildFileSearchRequest(token, query))
 }
 
 // GetPeerAddress sends a GetPeerAddress request to the server.
 func (c *Client) GetPeerAddress(username string) error {
-	return c.write(BuildGetPeerAddressRequest(username))
+	return c.write(protocol.BuildGetPeerAddressRequest(username))
 }
 
 // SendConnectToPeer sends a ConnectToPeer request to the server.
 func (c *Client) SendConnectToPeer(token uint32, username, connType string) error {
-	return c.write(BuildConnectToPeerRequest(token, username, connType))
+	return c.write(protocol.BuildConnectToPeerRequest(token, username, connType))
 }
 
 // SendCantConnectToPeer tells the server we could not connect to the peer of
 // an indirect ConnectToPeer request it relayed to us.
 func (c *Client) SendCantConnectToPeer(token uint32, username string) error {
-	return c.write(BuildCantConnectToPeer(token, username))
+	return c.write(protocol.BuildCantConnectToPeer(token, username))
 }
 
 // SendSharedFoldersFiles reports share counts to the server.
 func (c *Client) SendSharedFoldersFiles(dirs, files uint32) error {
-	return c.write(BuildSharedFoldersFiles(dirs, files))
+	return c.write(protocol.BuildSharedFoldersFiles(dirs, files))
 }
 
 // OnSearchRequest registers a callback for incoming search requests.
-func (c *Client) OnSearchRequest(fn func(*IncomingSearchRequest)) {
+func (c *Client) OnSearchRequest(fn func(*protocol.IncomingSearchRequest)) {
 	c.onSearchRequest = fn
 }
 
 // OnConnectToPeer registers a callback for ConnectToPeer notifications.
-func (c *Client) OnConnectToPeer(fn func(*ConnectToPeerResponse)) {
+func (c *Client) OnConnectToPeer(fn func(*protocol.ConnectToPeerResponse)) {
 	c.onConnectToPeer = fn
 }
 
 // OnPeerAddress registers a callback for PeerAddress responses.
-func (c *Client) OnPeerAddress(fn func(*PeerAddressResponse)) {
+func (c *Client) OnPeerAddress(fn func(*protocol.PeerAddressResponse)) {
 	c.onPeerAddress = fn
 }
 
 // GetUserStatus sends a GetUserStatus request (code 7) for the given username.
 func (c *Client) GetUserStatus(username string) error {
-	return c.write(BuildGetUserStatusRequest(username))
+	return c.write(protocol.BuildGetUserStatusRequest(username))
 }
 
 // WatchUser sends a WatchUser request (code 5) for the given username.
 func (c *Client) WatchUser(username string) error {
-	return c.write(BuildWatchUserRequest(username))
+	return c.write(protocol.BuildWatchUserRequest(username))
 }
 
 // OnUserStatus registers a callback for GetUserStatus responses (code 7).
 // This fires both for explicit GetUserStatus requests and for server-pushed
 // status changes after WatchUser subscriptions.
-func (c *Client) OnUserStatus(fn func(*UserStatusResponse)) {
+func (c *Client) OnUserStatus(fn func(*protocol.UserStatusResponse)) {
 	c.onUserStatus = fn
 }
 
@@ -327,9 +329,9 @@ func (c *Client) syncDistrib() error {
 		st = c.distribMgr.State()
 	}
 	for _, m := range [][]byte{
-		BuildHaveNoParent(!st.HasParent),
-		BuildBranchRoot(st.BranchRoot),
-		BuildBranchLevel(st.BranchLevel),
+		protocol.BuildHaveNoParent(!st.HasParent),
+		protocol.BuildBranchRoot(st.BranchRoot),
+		protocol.BuildBranchLevel(st.BranchLevel),
 	} {
 		if err := c.write(m); err != nil {
 			return err
@@ -351,7 +353,7 @@ func (c *Client) ExcludedSearchPhrases() []string {
 // messageLoop reads messages from the server in a loop and dispatches
 // them by code. It runs in a goroutine, owns conn for reads, and closes done
 // when the connection drops.
-func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
+func (c *Client) messageLoop(conn *protocol.Conn, done chan struct{}) {
 	defer close(done)
 	for {
 		msg, err := conn.ReadMessage()
@@ -368,31 +370,31 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 			return
 		}
 
-		r, err := NewReader(msg)
+		r, err := protocol.NewReader(msg)
 		if err != nil {
 			// Malformed message — skip.
 			continue
 		}
 
 		switch r.Code() {
-		case ServerPing:
+		case protocol.ServerPing:
 			// Respond with a ping.
-			pong := BuildPing()
+			pong := protocol.BuildPing()
 			if err := conn.WriteMessage(pong); err != nil {
 				slog.Error("failed to send pong", "component", "slsk", "err", err)
 			}
 
-		case ServerRelogged:
+		case protocol.ServerRelogged:
 			slog.Warn("slsk server reports another client logged in to this account", "component", "slsk")
 			c.setLost(ErrRelogged)
 			c.loggedIn.Store(false)
 			_ = conn.Close()
 			return
 
-		case ServerEmbeddedMessage:
+		case protocol.ServerEmbeddedMessage:
 			// Incoming search request (code 93).
 			slog.Debug("received EmbeddedMessage", "component", "slsk", "bytes", len(msg))
-			req, err := ParseServerSearchRequest(msg)
+			req, err := protocol.ParseServerSearchRequest(msg)
 			if err != nil {
 				slog.Warn("failed to parse search request", "component", "slsk", "err", err)
 				continue
@@ -401,8 +403,8 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.onSearchRequest(req)
 			}
 
-		case ServerConnectToPeer:
-			resp, err := ParseConnectToPeerResponse(msg)
+		case protocol.ServerConnectToPeer:
+			resp, err := protocol.ParseConnectToPeerResponse(msg)
 			if err != nil {
 				slog.Warn("failed to parse connect to peer", "component", "slsk", "err", err)
 				continue
@@ -411,8 +413,8 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.onConnectToPeer(resp)
 			}
 
-		case ServerGetPeerAddress:
-			resp, err := ParseGetPeerAddressResponse(msg)
+		case protocol.ServerGetPeerAddress:
+			resp, err := protocol.ParseGetPeerAddressResponse(msg)
 			if err != nil {
 				slog.Warn("failed to parse peer address", "component", "slsk", "err", err)
 				continue
@@ -421,21 +423,21 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.onPeerAddress(resp)
 			}
 
-		case ServerWatchUser:
-			resp, err := ParseWatchUserResponse(msg)
+		case protocol.ServerWatchUser:
+			resp, err := protocol.ParseWatchUserResponse(msg)
 			if err != nil {
 				slog.Warn("failed to parse watch user response", "component", "slsk", "err", err)
 				continue
 			}
 			if resp.Exists && c.onUserStatus != nil {
-				c.onUserStatus(&UserStatusResponse{
+				c.onUserStatus(&protocol.UserStatusResponse{
 					Username: resp.Username,
 					Status:   resp.Status,
 				})
 			}
 
-		case ServerGetStatus:
-			resp, err := ParseGetUserStatusResponse(msg)
+		case protocol.ServerGetStatus:
+			resp, err := protocol.ParseGetUserStatusResponse(msg)
 			if err != nil {
 				slog.Warn("failed to parse user status", "component", "slsk", "err", err)
 				continue
@@ -444,8 +446,8 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.onUserStatus(resp)
 			}
 
-		case ServerCannotConnect:
-			token, err := ParseCannotConnect(msg)
+		case protocol.ServerCannotConnect:
+			token, err := protocol.ParseCannotConnect(msg)
 			if err != nil {
 				slog.Warn("failed to parse CannotConnect", "component", "slsk", "err", err)
 				continue
@@ -455,8 +457,8 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.onCannotConnect(token)
 			}
 
-		case ServerNetInfo:
-			parents, err := ParseNetInfo(msg)
+		case protocol.ServerNetInfo:
+			parents, err := protocol.ParseNetInfo(msg)
 			if err != nil {
 				slog.Warn("failed to parse net info", "component", "slsk", "err", err)
 				continue
@@ -466,13 +468,13 @@ func (c *Client) messageLoop(conn *Conn, done chan struct{}) {
 				c.distribMgr.HandleNetInfo(parents)
 			}
 
-		case ServerCheckPrivileges, ServerRoomList, ServerPrivilegedUsers,
-			ServerParentMinSpeed, ServerParentSpeedRatio,
-			ServerWishlistInterval:
+		case protocol.ServerCheckPrivileges, protocol.ServerRoomList, protocol.ServerPrivilegedUsers,
+			protocol.ServerParentMinSpeed, protocol.ServerParentSpeedRatio,
+			protocol.ServerWishlistInterval:
 			// Known server messages we don't need to handle.
 
-		case ServerExcludedPhrases:
-			phrases, err := ParseExcludedSearchPhrases(msg)
+		case protocol.ServerExcludedPhrases:
+			phrases, err := protocol.ParseExcludedSearchPhrases(msg)
 			if err != nil {
 				slog.Warn("failed to parse excluded search phrases", "component", "slsk", "err", err)
 				continue

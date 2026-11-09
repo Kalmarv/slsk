@@ -2,6 +2,7 @@ package slsk
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kalmarv/slsk/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,21 +66,21 @@ func TestPeerManager_HandleIncoming_PeerInit(t *testing.T) {
 
 	// Register a message handler for a test message code (code 9 = PeerSearchResponse).
 	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
 		received <- msg
 	})
 
 	// Create a TCP pair: "remote" writes PeerInit + a peer message.
 	remote, local := tcpPair(t)
-	remoteConn := WrapConn(remote)
+	remoteConn := protocol.WrapConn(remote)
 
 	// Send PeerInit handshake.
-	initMsg := BuildPeerInit("remoteuser", ConnTypePeer, 42)
+	initMsg := protocol.BuildPeerInit("remoteuser", protocol.ConnTypePeer, 42)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
 	// Send a peer message after handshake (dummy search response-shaped message).
-	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg := protocol.NewBuilder(protocol.PeerSearchResponse)
 	testMsg.WriteUint32(0) // dummy payload
 	err = remoteConn.WriteMessage(testMsg.Build())
 	require.NoError(t, err)
@@ -89,7 +91,7 @@ func TestPeerManager_HandleIncoming_PeerInit(t *testing.T) {
 	select {
 	case msg := <-received:
 		assert.Equal(t, "remoteuser", msg.PeerConn.Username)
-		assert.Equal(t, PeerSearchResponse, msg.Code)
+		assert.Equal(t, protocol.PeerSearchResponse, msg.Code)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for peer message callback")
 	}
@@ -105,8 +107,8 @@ func TestPeerManager_HandleIncoming_PeerInit_FileTransfer(t *testing.T) {
 
 	remote, local := tcpPair(t)
 
-	initMsg := BuildPeerInit("uploader", ConnTypeTransfer, 777)
-	remoteConn := WrapConn(remote)
+	initMsg := protocol.BuildPeerInit("uploader", protocol.ConnTypeTransfer, 777)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
@@ -115,7 +117,7 @@ func TestPeerManager_HandleIncoming_PeerInit_FileTransfer(t *testing.T) {
 	select {
 	case pc := <-received:
 		assert.Equal(t, "uploader", pc.Username)
-		assert.Equal(t, ConnTypeTransfer, pc.Type)
+		assert.Equal(t, protocol.ConnTypeTransfer, pc.Type)
 		assert.Equal(t, uint32(777), pc.Token)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for file connection callback")
@@ -135,8 +137,8 @@ func TestPeerManager_HandleIncoming_PierceFirewall_MatchingToken(t *testing.T) {
 	remote, local := tcpPair(t)
 
 	// Write PierceFirewall from the remote side.
-	pfMsg := BuildPierceFirewall(token)
-	remoteConn := WrapConn(remote)
+	pfMsg := protocol.BuildPierceFirewall(token)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(pfMsg)
 	require.NoError(t, err)
 
@@ -160,8 +162,8 @@ func TestPeerManager_HandleIncoming_PierceFirewall_NoMatchingToken(t *testing.T)
 
 	remote, local := tcpPair(t)
 
-	pfMsg := BuildPierceFirewall(99999)
-	remoteConn := WrapConn(remote)
+	pfMsg := protocol.BuildPierceFirewall(99999)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(pfMsg)
 	require.NoError(t, err)
 
@@ -187,11 +189,11 @@ func TestPeerManager_HandleIncoming_UnknownInitCode(t *testing.T) {
 	// Format: [4-byte length][1-byte code=99][some payload]
 	payload := []byte{0x01, 0x02, 0x03, 0x04}
 	msg := make([]byte, 4+1+len(payload))
-	le.PutUint32(msg[0:4], uint32(1+len(payload)))
+	binary.LittleEndian.PutUint32(msg[0:4], uint32(1+len(payload)))
 	msg[4] = 99
 	copy(msg[5:], payload)
 
-	remoteConn := WrapConn(remote)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(msg)
 	require.NoError(t, err)
 
@@ -210,8 +212,8 @@ func TestPeerManager_HandleIncoming_DistributedType_Closed(t *testing.T) {
 	// No D handler registered; should close.
 	remote, local := tcpPair(t)
 
-	initMsg := BuildPeerInit("distuser", ConnTypeDistributed, 555)
-	remoteConn := WrapConn(remote)
+	initMsg := protocol.BuildPeerInit("distuser", protocol.ConnTypeDistributed, 555)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
@@ -233,7 +235,7 @@ func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 
 	// Register a message handler.
 	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
 		received <- msg
 	})
 
@@ -264,12 +266,12 @@ func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 	require.NoError(t, err)
 	defer raw.Close()
 
-	conn := WrapConn(raw)
-	initMsg := BuildPeerInit("remotepeer", ConnTypePeer, 1001)
+	conn := protocol.WrapConn(raw)
+	initMsg := protocol.BuildPeerInit("remotepeer", protocol.ConnTypePeer, 1001)
 	err = conn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
-	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg := protocol.NewBuilder(protocol.PeerSearchResponse)
 	testMsg.WriteUint32(0)
 	err = conn.WriteMessage(testMsg.Build())
 	require.NoError(t, err)
@@ -318,8 +320,8 @@ func TestPeerManager_Listen_AcceptsPierceFirewall(t *testing.T) {
 	require.NoError(t, err)
 	defer raw.Close()
 
-	conn := WrapConn(raw)
-	pfMsg := BuildPierceFirewall(token)
+	conn := protocol.WrapConn(raw)
+	pfMsg := protocol.BuildPierceFirewall(token)
 	err = conn.WriteMessage(pfMsg)
 	require.NoError(t, err)
 
@@ -345,7 +347,7 @@ func TestPeerManager_ConnectDirect(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	receivedInit := make(chan *PeerInitMessage, 1)
+	receivedInit := make(chan *protocol.PeerInitMessage, 1)
 	go func() {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -353,12 +355,12 @@ func TestPeerManager_ConnectDirect(t *testing.T) {
 		}
 		defer raw.Close()
 
-		sc := WrapConn(raw)
+		sc := protocol.WrapConn(raw)
 		msg, err := sc.ReadMessage()
 		if err != nil {
 			return
 		}
-		init, err := ParsePeerInit(msg)
+		init, err := protocol.ParsePeerInit(msg)
 		if err != nil {
 			return
 		}
@@ -370,7 +372,7 @@ func TestPeerManager_ConnectDirect(t *testing.T) {
 	var port int
 	fmt.Sscanf(portStr, "%d", &port)
 
-	addr := &PeerAddressResponse{
+	addr := &protocol.PeerAddressResponse{
 		Username: "targetpeer",
 		IP:       net.ParseIP(host),
 		Port:     uint32(port),
@@ -379,19 +381,19 @@ func TestPeerManager_ConnectDirect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	pc, err := pm.connectDirect(ctx, addr, "targetpeer", ConnTypePeer, 9999)
+	pc, err := pm.connectDirect(ctx, addr, "targetpeer", protocol.ConnTypePeer, 9999)
 	require.NoError(t, err)
 	defer pc.Conn.Close()
 
 	assert.Equal(t, "targetpeer", pc.Username)
-	assert.Equal(t, ConnTypePeer, pc.Type)
+	assert.Equal(t, protocol.ConnTypePeer, pc.Type)
 	assert.Equal(t, uint32(9999), pc.Token)
 
 	// Verify the mock peer received our PeerInit.
 	select {
 	case init := <-receivedInit:
 		assert.Equal(t, "myuser", init.Username)
-		assert.Equal(t, ConnTypePeer, init.Type)
+		assert.Equal(t, protocol.ConnTypePeer, init.Type)
 		assert.Equal(t, uint32(9999), init.Token)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for mock peer to receive PeerInit")
@@ -402,7 +404,7 @@ func TestPeerManager_ConnectDirect_DialFailure(t *testing.T) {
 	pm := newTestPeerManager("myuser")
 
 	// Use an address that will refuse connection.
-	addr := &PeerAddressResponse{
+	addr := &protocol.PeerAddressResponse{
 		Username: "unreachable",
 		IP:       net.ParseIP("127.0.0.1"),
 		Port:     1, // port 1 should refuse
@@ -411,7 +413,7 @@ func TestPeerManager_ConnectDirect_DialFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, err := pm.connectDirect(ctx, addr, "unreachable", ConnTypePeer, 1111)
+	_, err := pm.connectDirect(ctx, addr, "unreachable", protocol.ConnTypePeer, 1111)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dial")
 }
@@ -464,8 +466,8 @@ func TestPeerManager_PendingTokens_MultipleTokens(t *testing.T) {
 	for i, tok := range tokens {
 		remote, local := tcpPair(t)
 
-		pfMsg := BuildPierceFirewall(tok)
-		remoteConn := WrapConn(remote)
+		pfMsg := protocol.BuildPierceFirewall(tok)
+		remoteConn := protocol.WrapConn(remote)
 		err := remoteConn.WriteMessage(pfMsg)
 		require.NoError(t, err)
 
@@ -491,8 +493,8 @@ func TestPeerManager_NoHandler_DoesNotPanic(t *testing.T) {
 
 	remote, local := tcpPair(t)
 
-	initMsg := BuildPeerInit("someuser", ConnTypePeer, 1)
-	remoteConn := WrapConn(remote)
+	initMsg := protocol.BuildPeerInit("someuser", protocol.ConnTypePeer, 1)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
@@ -509,8 +511,8 @@ func TestPeerManager_NoFileHandler_DoesNotPanic(t *testing.T) {
 
 	remote, local := tcpPair(t)
 
-	initMsg := BuildPeerInit("someuser", ConnTypeTransfer, 2)
-	remoteConn := WrapConn(remote)
+	initMsg := protocol.BuildPeerInit("someuser", protocol.ConnTypeTransfer, 2)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(initMsg)
 	require.NoError(t, err)
 
@@ -558,8 +560,8 @@ func TestPeerManager_ConnectIndirect_TokenDelivery(t *testing.T) {
 	remote, local := tcpPair(t)
 	_ = remote // remote end not needed beyond creating the pair
 
-	pfMsg := BuildPierceFirewall(token)
-	remoteConn := WrapConn(remote)
+	pfMsg := protocol.BuildPierceFirewall(token)
+	remoteConn := protocol.WrapConn(remote)
 	err := remoteConn.WriteMessage(pfMsg)
 	require.NoError(t, err)
 
@@ -588,7 +590,7 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 
 	// Register a message handler.
 	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(PeerSearchResponse, func(msg *PeerMessage) {
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
 		received <- msg
 	})
 
@@ -607,9 +609,9 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	addr := ln.Addr().(*net.TCPAddr)
 
 	// Simulate server sending us ConnectToPeer.
-	resp := &ConnectToPeerResponse{
+	resp := &protocol.ConnectToPeerResponse{
 		Username: "remoteuser",
-		Type:     ConnTypePeer,
+		Type:     protocol.ConnTypePeer,
 		IP:       net.ParseIP("127.0.0.1"),
 		Port:     uint32(addr.Port),
 		Token:    12345,
@@ -622,16 +624,16 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	require.NotNil(t, peerConn)
 	defer peerConn.Close()
 
-	peerWrapped := WrapConn(peerConn)
+	peerWrapped := protocol.WrapConn(peerConn)
 	msg, err := peerWrapped.ReadMessage()
 	require.NoError(t, err)
 
-	token, err := ParsePierceFirewall(msg)
+	token, err := protocol.ParsePierceFirewall(msg)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(12345), token)
 
 	// Send a peer message from the remote side so routePeerMessages dispatches it.
-	testMsg := NewBuilder(PeerSearchResponse)
+	testMsg := protocol.NewBuilder(protocol.PeerSearchResponse)
 	testMsg.WriteUint32(0)
 	err = peerWrapped.WriteMessage(testMsg.Build())
 	require.NoError(t, err)
@@ -640,7 +642,7 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	select {
 	case m := <-received:
 		assert.Equal(t, "remoteuser", m.PeerConn.Username)
-		assert.Equal(t, PeerSearchResponse, m.Code)
+		assert.Equal(t, protocol.PeerSearchResponse, m.Code)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for peer message callback")
 	}
@@ -666,9 +668,9 @@ func TestPeerManager_HandleConnectToPeer_FileType(t *testing.T) {
 
 	addr := ln.Addr().(*net.TCPAddr)
 
-	resp := &ConnectToPeerResponse{
+	resp := &protocol.ConnectToPeerResponse{
 		Username: "uploader",
-		Type:     ConnTypeTransfer,
+		Type:     protocol.ConnTypeTransfer,
 		IP:       net.ParseIP("127.0.0.1"),
 		Port:     uint32(addr.Port),
 		Token:    99999,
@@ -681,18 +683,18 @@ func TestPeerManager_HandleConnectToPeer_FileType(t *testing.T) {
 	defer peerConn.Close()
 
 	// Verify PierceFirewall was sent.
-	peerWrapped := WrapConn(peerConn)
+	peerWrapped := protocol.WrapConn(peerConn)
 	msg, err := peerWrapped.ReadMessage()
 	require.NoError(t, err)
 
-	token, err := ParsePierceFirewall(msg)
+	token, err := protocol.ParsePierceFirewall(msg)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(99999), token)
 
 	select {
 	case pc := <-received:
 		assert.Equal(t, "uploader", pc.Username)
-		assert.Equal(t, ConnTypeTransfer, pc.Type)
+		assert.Equal(t, protocol.ConnTypeTransfer, pc.Type)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for file connection callback")
 	}
@@ -702,9 +704,9 @@ func TestPeerManager_HandleConnectToPeer_UnreachablePeer(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	// Use a port that's not listening — should fail gracefully.
-	resp := &ConnectToPeerResponse{
+	resp := &protocol.ConnectToPeerResponse{
 		Username: "ghost",
-		Type:     ConnTypePeer,
+		Type:     protocol.ConnTypePeer,
 		IP:       net.ParseIP("127.0.0.1"),
 		Port:     1, // unlikely to be open
 		Token:    55555,
@@ -736,14 +738,14 @@ func TestPeerManager_HandleIncoming_ImmediateClose(t *testing.T) {
 func TestIsValidAddr(t *testing.T) {
 	tests := []struct {
 		name  string
-		addr  *PeerAddressResponse
+		addr  *protocol.PeerAddressResponse
 		valid bool
 	}{
-		{"normal address", &PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 2234}, true},
-		{"zero IP", &PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 2234}, false},
-		{"zero port", &PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 0}, false},
-		{"both zero", &PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 0}, false},
-		{"nil IP", &PeerAddressResponse{IP: nil, Port: 2234}, false},
+		{"normal address", &protocol.PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 2234}, true},
+		{"zero IP", &protocol.PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 2234}, false},
+		{"zero port", &protocol.PeerAddressResponse{IP: net.ParseIP("192.168.1.1"), Port: 0}, false},
+		{"both zero", &protocol.PeerAddressResponse{IP: net.ParseIP("0.0.0.0"), Port: 0}, false},
+		{"nil IP", &protocol.PeerAddressResponse{IP: nil, Port: 2234}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -756,9 +758,9 @@ func TestPeerManager_HandleConnectToPeer_InvalidAddr(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	// Should return immediately without dialing.
-	resp := &ConnectToPeerResponse{
+	resp := &protocol.ConnectToPeerResponse{
 		Username: "ghost",
-		Type:     ConnTypePeer,
+		Type:     protocol.ConnTypePeer,
 		IP:       net.ParseIP("0.0.0.0"),
 		Port:     0,
 		Token:    55555,
@@ -893,15 +895,15 @@ func TestPeerManager_RemoveAddrWaiter(t *testing.T) {
 
 // readCantConnect returns the (token, username) of the next code-1001 message
 // the mock server receives.
-func readCantConnect(t *testing.T, sc *Conn) (uint32, string) {
+func readCantConnect(t *testing.T, sc *protocol.Conn) (uint32, string) {
 	t.Helper()
 	sc.Raw().SetReadDeadline(time.Now().Add(3 * time.Second))
 	for {
 		msg, err := sc.ReadMessage()
 		require.NoError(t, err, "no CantConnectToPeer reached the server")
-		r, err := NewReader(msg)
+		r, err := protocol.NewReader(msg)
 		require.NoError(t, err)
-		if r.Code() != ServerCannotConnect {
+		if r.Code() != protocol.ServerCannotConnect {
 			continue
 		}
 		token, err := r.ReadUint32()
@@ -935,8 +937,8 @@ func TestPeerManager_HandleConnectToPeer_ReportsCantConnect(t *testing.T) {
 			pm := newTestPeerManager("me")
 			pm.client = client
 
-			go pm.handleConnectToPeer(&ConnectToPeerResponse{
-				Username: "ghost", Type: ConnTypePeer, IP: net.ParseIP(tc.ip), Port: tc.port, Token: 4242,
+			go pm.handleConnectToPeer(&protocol.ConnectToPeerResponse{
+				Username: "ghost", Type: protocol.ConnTypePeer, IP: net.ParseIP(tc.ip), Port: tc.port, Token: 4242,
 			})
 
 			token, user := readCantConnect(t, sc)
@@ -947,9 +949,9 @@ func TestPeerManager_HandleConnectToPeer_ReportsCantConnect(t *testing.T) {
 }
 
 func TestBuildCantConnectToPeer(t *testing.T) {
-	r, err := NewReader(BuildCantConnectToPeer(7, "bob"))
+	r, err := protocol.NewReader(protocol.BuildCantConnectToPeer(7, "bob"))
 	require.NoError(t, err)
-	assert.Equal(t, ServerCannotConnect, r.Code())
+	assert.Equal(t, protocol.ServerCannotConnect, r.Code())
 	token, _ := r.ReadUint32()
 	user, _ := r.ReadString()
 	assert.Equal(t, uint32(7), token)
@@ -963,7 +965,7 @@ func TestBuildCantConnectToPeer(t *testing.T) {
 
 // racingPM returns a PeerManager on a logged-in client plus the mock server's
 // connection, so SendConnectToPeer really reaches a (fake) server.
-func racingPM(t *testing.T) (*PeerManager, *Conn) {
+func racingPM(t *testing.T) (*PeerManager, *protocol.Conn) {
 	t.Helper()
 	client, serverSide := connectedClient(t)
 	sc := <-serverSide
@@ -972,7 +974,7 @@ func racingPM(t *testing.T) (*PeerManager, *Conn) {
 	return pm, sc
 }
 
-var testAddr = &PeerAddressResponse{IP: net.ParseIP("127.0.0.1"), Port: 2234}
+var testAddr = &protocol.PeerAddressResponse{IP: net.ParseIP("127.0.0.1"), Port: 2234}
 
 // deliverIndirect plays the part of handleIncoming matching a PierceFirewall:
 // once the token is pending it hands over a connection and returns its far end.
@@ -984,7 +986,7 @@ func deliverIndirect(t *testing.T, pm *PeerManager, token uint32) net.Conn {
 		defer pm.mu.Unlock()
 		ch, ok := pm.pendingTokens[token]
 		if ok {
-			ch <- connectResult{pc: &PeerConn{Conn: WrapPeerConn(near), Token: token}}
+			ch <- connectResult{pc: &PeerConn{Conn: protocol.WrapPeerConn(near), Token: token}}
 		}
 		return ok
 	}, 2*time.Second, 5*time.Millisecond)
@@ -1002,11 +1004,11 @@ func TestConnectRacing_IndirectWinsWhileDirectBlocks(t *testing.T) {
 
 	go deliverIndirect(t, pm, 77)
 	start := time.Now()
-	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", ConnTypePeer, 77)
+	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", protocol.ConnTypePeer, 77)
 	require.NoError(t, err)
 	assert.Less(t, time.Since(start), directConnectTimeout/2, "indirect must not wait for the direct leg")
 	assert.Equal(t, "peer", pc.Username)
-	assert.Equal(t, ConnTypePeer, pc.Type)
+	assert.Equal(t, protocol.ConnTypePeer, pc.Type)
 	pc.Conn.Close()
 
 	select {
@@ -1024,21 +1026,21 @@ func TestConnectRacing_DirectWinsAndLateIndirectIsClosed(t *testing.T) {
 	far, near := tcpPair(t)
 	pm.dial = func(context.Context, string) (net.Conn, error) { return near, nil }
 
-	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", ConnTypePeer, 78)
+	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", protocol.ConnTypePeer, 78)
 	require.NoError(t, err)
 	assert.Same(t, near, pc.Conn.Raw())
 
 	// The direct leg sent PeerInit and the server was asked to relay too.
-	msg, err := WrapPeerConn(far).ReadMessage()
+	msg, err := protocol.WrapPeerConn(far).ReadMessage()
 	require.NoError(t, err)
-	init, err := ParsePeerInit(msg)
+	init, err := protocol.ParsePeerInit(msg)
 	require.NoError(t, err)
 	assert.Equal(t, "me", init.Username)
 	sc.Raw().SetReadDeadline(time.Now().Add(2 * time.Second))
 	for {
 		m, err := sc.ReadMessage()
 		require.NoError(t, err, "indirect ConnectToPeer request never reached the server")
-		if r, _ := NewReader(m); r != nil && r.Code() == ServerConnectToPeer {
+		if r, _ := protocol.NewReader(m); r != nil && r.Code() == protocol.ServerConnectToPeer {
 			break
 		}
 	}
@@ -1054,7 +1056,7 @@ func TestConnectRacing_DirectFailureFallsBackToIndirect(t *testing.T) {
 	pm.dial = func(context.Context, string) (net.Conn, error) { return nil, errors.New("refused") }
 
 	go deliverIndirect(t, pm, 79)
-	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", ConnTypePeer, 79)
+	pc, err := pm.connectRacing(context.Background(), testAddr, "peer", protocol.ConnTypePeer, 79)
 	require.NoError(t, err)
 	pc.Conn.Close()
 }
@@ -1074,14 +1076,14 @@ func TestConnectRacing_BothFail(t *testing.T) {
 			return ok
 		}, 2*time.Second, 5*time.Millisecond)
 	}()
-	_, err := pm.connectRacing(context.Background(), testAddr, "peer", ConnTypePeer, 80)
+	_, err := pm.connectRacing(context.Background(), testAddr, "peer", protocol.ConnTypePeer, 80)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refused")
 	assert.Contains(t, err.Error(), "cannot connect")
 }
 
 // answerPeerAddress fulfils the next GetPeerAddress wait for username.
-func answerPeerAddress(t *testing.T, pm *PeerManager, resp *PeerAddressResponse) {
+func answerPeerAddress(t *testing.T, pm *PeerManager, resp *protocol.PeerAddressResponse) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		pm.mu.Lock()
@@ -1099,9 +1101,9 @@ func TestConnectToPeer_OfflinePeerFailsFast(t *testing.T) {
 		return nil, errors.New("unreachable")
 	}
 
-	go answerPeerAddress(t, pm, &PeerAddressResponse{Username: "gone", IP: net.IPv4zero, Port: 0})
+	go answerPeerAddress(t, pm, &protocol.PeerAddressResponse{Username: "gone", IP: net.IPv4zero, Port: 0})
 	start := time.Now()
-	_, err := pm.ConnectToPeer(context.Background(), "gone", ConnTypePeer)
+	_, err := pm.ConnectToPeer(context.Background(), "gone", protocol.ConnTypePeer)
 	require.ErrorIs(t, err, ErrPeerOffline)
 	assert.Less(t, time.Since(start), 2*time.Second)
 
@@ -1112,8 +1114,8 @@ func TestConnectToPeer_OfflinePeerFailsFast(t *testing.T) {
 		if err != nil {
 			break
 		}
-		if r, _ := NewReader(m); r != nil {
-			assert.NotEqual(t, ServerConnectToPeer, r.Code())
+		if r, _ := protocol.NewReader(m); r != nil {
+			assert.NotEqual(t, protocol.ServerConnectToPeer, r.Code())
 		}
 	}
 }
@@ -1126,19 +1128,19 @@ func TestConnectToPeer_OutboundPConnectionIsRouted(t *testing.T) {
 	pm.dial = func(context.Context, string) (net.Conn, error) { return near, nil }
 
 	got := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(PeerTransferResponse, func(m *PeerMessage) { got <- m })
+	pm.OnPeerMessage(protocol.PeerTransferResponse, func(m *PeerMessage) { got <- m })
 
-	go answerPeerAddress(t, pm, &PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
-	pc, err := pm.ConnectToPeer(context.Background(), "peer", ConnTypePeer)
+	go answerPeerAddress(t, pm, &protocol.PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
+	pc, err := pm.ConnectToPeer(context.Background(), "peer", protocol.ConnTypePeer)
 	require.NoError(t, err)
 	defer pc.Conn.Close()
 
-	require.NoError(t, WrapPeerConn(far).WriteMessage(BuildTransferResponseAllowed(5)))
+	require.NoError(t, protocol.WrapPeerConn(far).WriteMessage(protocol.BuildTransferResponseAllowed(5)))
 	select {
 	case m := <-got:
 		assert.Equal(t, "peer", m.PeerConn.Username)
 		assert.Same(t, pc, m.PeerConn)
-		resp, err := ParseTransferResponse(m.Raw)
+		resp, err := protocol.ParseTransferResponse(m.Raw)
 		require.NoError(t, err)
 		assert.Equal(t, uint32(5), resp.Token)
 	case <-time.After(2 * time.Second):
@@ -1151,10 +1153,10 @@ func TestConnectToPeer_FileConnectionIsNotRouted(t *testing.T) {
 	pm, _ := racingPM(t)
 	far, near := tcpPair(t)
 	pm.dial = func(context.Context, string) (net.Conn, error) { return near, nil }
-	pm.OnPeerMessage(PeerTransferResponse, func(*PeerMessage) { t.Error("F connection was routed") })
+	pm.OnPeerMessage(protocol.PeerTransferResponse, func(*PeerMessage) { t.Error("F connection was routed") })
 
-	go answerPeerAddress(t, pm, &PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
-	pc, err := pm.ConnectToPeer(context.Background(), "peer", ConnTypeTransfer)
+	go answerPeerAddress(t, pm, &protocol.PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
+	pc, err := pm.ConnectToPeer(context.Background(), "peer", protocol.ConnTypeTransfer)
 	require.NoError(t, err)
 	defer pc.Conn.Close()
 

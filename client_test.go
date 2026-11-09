@@ -6,11 +6,13 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/kalmarv/slsk/protocol"
 )
 
 // startMockServer starts a TCP listener on a random port, runs the handler
 // in a goroutine for the first accepted connection, and returns the address.
-func startMockServer(t *testing.T, handler func(*Conn)) string {
+func startMockServer(t *testing.T, handler func(*protocol.Conn)) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -22,7 +24,7 @@ func startMockServer(t *testing.T, handler func(*Conn)) string {
 		if err != nil {
 			return
 		}
-		handler(WrapConn(raw))
+		handler(protocol.WrapConn(raw))
 	}()
 	return listener.Addr().String()
 }
@@ -36,7 +38,7 @@ func buildLoginSuccessResponse() []byte {
 	payload = appendStr(payload, "somehash")
 	payload = append(payload, 0) // not supporter
 
-	return buildMsg(ServerLogin, payload)
+	return buildMsg(protocol.ServerLogin, payload)
 }
 
 // buildLoginFailureResponse builds a raw wire login failure response message.
@@ -44,13 +46,13 @@ func buildLoginFailureResponse(reason string) []byte {
 	var payload []byte
 	payload = append(payload, 0) // success = false
 	payload = appendStr(payload, reason)
-	return buildMsg(ServerLogin, payload)
+	return buildMsg(protocol.ServerLogin, payload)
 }
 
 // drainInitMessages reads and discards all post-login init messages
 // (CheckPrivileges, SetListenPort, SetStatus, HaveNoParent, BranchRoot,
 // BranchLevel, AcceptChildren). Uses a short deadline to avoid blocking.
-func drainInitMessages(sc *Conn) {
+func drainInitMessages(sc *protocol.Conn) {
 	sc.Raw().SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	for {
 		if _, err := sc.ReadMessage(); err != nil {
@@ -62,7 +64,7 @@ func drainInitMessages(sc *Conn) {
 
 // handleLogin reads a login request and sends the given response.
 // Returns the login message for inspection, or nil on error.
-func handleLogin(t *testing.T, sc *Conn, response []byte) []byte {
+func handleLogin(t *testing.T, sc *protocol.Conn, response []byte) []byte {
 	t.Helper()
 	msg, err := sc.ReadMessage()
 	if err != nil {
@@ -80,7 +82,7 @@ func TestClient_LoginSuccess(t *testing.T) {
 	// Channel receives the first post-login message from the client.
 	setListenPortMsg := make(chan []byte, 1)
 
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		// Read login request, send success.
 		handleLogin(t, sc, buildLoginSuccessResponse())
@@ -93,11 +95,11 @@ func TestClient_LoginSuccess(t *testing.T) {
 				t.Errorf("mock server: read after login: %v", err)
 				return
 			}
-			r, err := NewReader(msg)
+			r, err := protocol.NewReader(msg)
 			if err != nil {
 				continue
 			}
-			if r.Code() == ServerSetListenPort {
+			if r.Code() == protocol.ServerSetListenPort {
 				setListenPortMsg <- msg
 				break
 			}
@@ -134,12 +136,12 @@ func TestClient_LoginSuccess(t *testing.T) {
 	// Verify the client sent SetListenPort.
 	select {
 	case msg := <-setListenPortMsg:
-		r, err := NewReader(msg)
+		r, err := protocol.NewReader(msg)
 		if err != nil {
 			t.Fatalf("NewReader: %v", err)
 		}
-		if r.Code() != ServerSetListenPort {
-			t.Fatalf("code = %d, want %d (ServerSetListenPort)", r.Code(), ServerSetListenPort)
+		if r.Code() != protocol.ServerSetListenPort {
+			t.Fatalf("code = %d, want %d (ServerSetListenPort)", r.Code(), protocol.ServerSetListenPort)
 		}
 		port, err := r.ReadUint32()
 		if err != nil {
@@ -154,7 +156,7 @@ func TestClient_LoginSuccess(t *testing.T) {
 }
 
 func TestClient_LoginFailure(t *testing.T) {
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginFailureResponse("INVALIDPASS"))
 	})
@@ -191,7 +193,7 @@ func TestClient_LoginFailure(t *testing.T) {
 func TestClient_Search(t *testing.T) {
 	searchReceived := make(chan []byte, 1)
 
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
@@ -201,11 +203,11 @@ func TestClient_Search(t *testing.T) {
 			if err != nil {
 				return
 			}
-			r, err := NewReader(msg)
+			r, err := protocol.NewReader(msg)
 			if err != nil {
 				continue
 			}
-			if r.Code() == ServerFileSearch {
+			if r.Code() == protocol.ServerFileSearch {
 				searchReceived <- msg
 				return
 			}
@@ -239,12 +241,12 @@ func TestClient_Search(t *testing.T) {
 
 	select {
 	case msg := <-searchReceived:
-		r, err := NewReader(msg)
+		r, err := protocol.NewReader(msg)
 		if err != nil {
 			t.Fatalf("NewReader: %v", err)
 		}
-		if r.Code() != ServerFileSearch {
-			t.Fatalf("code = %d, want %d", r.Code(), ServerFileSearch)
+		if r.Code() != protocol.ServerFileSearch {
+			t.Fatalf("code = %d, want %d", r.Code(), protocol.ServerFileSearch)
 		}
 		tk, err := r.ReadUint32()
 		if err != nil {
@@ -268,7 +270,7 @@ func TestClient_Search(t *testing.T) {
 func TestClient_PingResponse(t *testing.T) {
 	pongReceived := make(chan struct{}, 1)
 
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
@@ -276,7 +278,7 @@ func TestClient_PingResponse(t *testing.T) {
 		drainInitMessages(sc)
 
 		// Send a ping to the client.
-		ping := BuildPing()
+		ping := protocol.BuildPing()
 		if err := sc.WriteMessage(ping); err != nil {
 			t.Errorf("mock server: write ping: %v", err)
 			return
@@ -288,11 +290,11 @@ func TestClient_PingResponse(t *testing.T) {
 			if err != nil {
 				return
 			}
-			r, err := NewReader(msg)
+			r, err := protocol.NewReader(msg)
 			if err != nil {
 				continue
 			}
-			if r.Code() == ServerPing {
+			if r.Code() == protocol.ServerPing {
 				pongReceived <- struct{}{}
 				return
 			}
@@ -326,9 +328,9 @@ func TestClient_PingResponse(t *testing.T) {
 }
 
 func TestClient_OnSearchRequest(t *testing.T) {
-	callbackFired := make(chan *IncomingSearchRequest, 1)
+	callbackFired := make(chan *protocol.IncomingSearchRequest, 1)
 
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
@@ -337,12 +339,12 @@ func TestClient_OnSearchRequest(t *testing.T) {
 
 		// Send an incoming search request (code 93 = ServerEmbeddedMessage).
 		var payload []byte
-		payload = append(payload, byte(DistribSearchRequest)) // distrib code = 3
-		payload = append(payload, u32le(49)...)               // identifier
+		payload = append(payload, byte(protocol.DistribSearchRequest)) // distrib code = 3
+		payload = append(payload, u32le(49)...)                        // identifier
 		payload = appendStr(payload, "searchuser")
 		payload = append(payload, u32le(42)...) // token
 		payload = appendStr(payload, "pink floyd")
-		msg := buildMsg(ServerEmbeddedMessage, payload)
+		msg := buildMsg(protocol.ServerEmbeddedMessage, payload)
 		if err := sc.WriteMessage(msg); err != nil {
 			t.Errorf("mock server: write search: %v", err)
 			return
@@ -362,7 +364,7 @@ func TestClient_OnSearchRequest(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	client.OnSearchRequest(func(req *IncomingSearchRequest) {
+	client.OnSearchRequest(func(req *protocol.IncomingSearchRequest) {
 		callbackFired <- req
 	})
 
@@ -391,9 +393,9 @@ func TestClient_OnSearchRequest(t *testing.T) {
 }
 
 func TestClient_OnConnectToPeer(t *testing.T) {
-	callbackFired := make(chan *ConnectToPeerResponse, 1)
+	callbackFired := make(chan *protocol.ConnectToPeerResponse, 1)
 
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 
@@ -408,7 +410,7 @@ func TestClient_OnConnectToPeer(t *testing.T) {
 		payload = append(payload, u32le(2234)...)  // port
 		payload = append(payload, u32le(99999)...) // token
 		payload = append(payload, 1)               // privileged
-		msg := buildMsg(ServerConnectToPeer, payload)
+		msg := buildMsg(protocol.ServerConnectToPeer, payload)
 		if err := sc.WriteMessage(msg); err != nil {
 			t.Errorf("mock server: write connect to peer: %v", err)
 			return
@@ -427,7 +429,7 @@ func TestClient_OnConnectToPeer(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	client.OnConnectToPeer(func(resp *ConnectToPeerResponse) {
+	client.OnConnectToPeer(func(resp *protocol.ConnectToPeerResponse) {
 		callbackFired <- resp
 	})
 
@@ -466,7 +468,7 @@ func TestClient_OnConnectToPeer(t *testing.T) {
 }
 
 func TestClient_Close(t *testing.T) {
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		defer sc.Close()
 		handleLogin(t, sc, buildLoginSuccessResponse())
 		// Keep connection alive until the client closes.
@@ -515,10 +517,10 @@ func TestClient_Close(t *testing.T) {
 
 // connectedClient logs a Client in to a mock server and hands the server side
 // of the connection to the test through the returned channel.
-func connectedClient(t *testing.T) (*Client, <-chan *Conn) {
+func connectedClient(t *testing.T) (*Client, <-chan *protocol.Conn) {
 	t.Helper()
-	serverSide := make(chan *Conn, 1)
-	addr := startMockServer(t, func(sc *Conn) {
+	serverSide := make(chan *protocol.Conn, 1)
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		handleLogin(t, sc, buildLoginSuccessResponse())
 		drainInitMessages(sc)
 		serverSide <- sc
@@ -544,7 +546,7 @@ func TestClient_Relogged(t *testing.T) {
 	if client.DisconnectReason() != nil {
 		t.Fatalf("DisconnectReason = %v while connected", client.DisconnectReason())
 	}
-	if err := sc.WriteMessage(NewBuilder(ServerRelogged).Build()); err != nil {
+	if err := sc.WriteMessage(protocol.NewBuilder(protocol.ServerRelogged).Build()); err != nil {
 		t.Fatal(err)
 	}
 	select {

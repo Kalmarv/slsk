@@ -1,4 +1,4 @@
-package slsk
+package protocol
 
 // Server message codes (4-byte LE code in server↔client messages).
 const (

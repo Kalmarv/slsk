@@ -1,4 +1,4 @@
-package slsk
+package protocol
 
 import (
 	"crypto/md5"

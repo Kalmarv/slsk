@@ -8,12 +8,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kalmarv/slsk/protocol"
 )
 
 // startDistribParent starts a TCP listener that simulates a distributed parent.
 // It accepts one connection, sends BranchLevel, BranchRoot, and a search request,
 // then keeps the connection open. Returns the listener address.
-func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, search *IncomingSearchRequest) string {
+func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, search *protocol.IncomingSearchRequest) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -26,29 +28,24 @@ func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, sea
 		if err != nil {
 			return
 		}
-		conn := WrapConn(raw)
+		conn := protocol.WrapConn(raw)
 
 		// Read the PeerInit from the connecting client.
 		conn.ReadMessage()
 
 		// Send BranchLevel.
-		if err := conn.WriteMessage(BuildDistribBranchLevel(branchLevel)); err != nil {
+		if err := conn.WriteMessage(protocol.BuildDistribBranchLevel(branchLevel)); err != nil {
 			return
 		}
 
 		// Send BranchRoot.
-		if err := conn.WriteMessage(BuildDistribBranchRoot(branchRoot)); err != nil {
+		if err := conn.WriteMessage(protocol.BuildDistribBranchRoot(branchRoot)); err != nil {
 			return
 		}
 
 		// Send a search request.
 		if search != nil {
-			b := NewInitBuilder(DistribSearchRequest)
-			b.WriteUint32(distribSearchIdentifier)
-			b.WriteString(search.Username)
-			b.WriteUint32(search.Token)
-			b.WriteString(search.Query)
-			if err := conn.WriteMessage(b.Build()); err != nil {
+			if err := conn.WriteMessage(protocol.BuildDistribSearchRequest(search.Username, search.Token, search.Query)); err != nil {
 				return
 			}
 		}
@@ -66,7 +63,7 @@ func startDistribParent(t *testing.T, branchLevel uint32, branchRoot string, sea
 }
 
 func TestDistribManager_ConnectsToParent(t *testing.T) {
-	search := &IncomingSearchRequest{
+	search := &protocol.IncomingSearchRequest{
 		Username: "searcher",
 		Token:    12345,
 		Query:    "test query",
@@ -78,12 +75,12 @@ func TestDistribManager_ConnectsToParent(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &port)
 	ip := net.ParseIP(host).To4()
 
-	searchReceived := make(chan *IncomingSearchRequest, 1)
-	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
+	searchReceived := make(chan *protocol.IncomingSearchRequest, 1)
+	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
-	parents := []PotentialParent{
+	parents := []protocol.PotentialParent{
 		{Username: "rootuser", IP: ip, Port: uint32(port)},
 	}
 
@@ -121,7 +118,7 @@ func TestDistribManager_ConnectsToParent(t *testing.T) {
 func TestDistribManager_AdoptsFirstValidParent(t *testing.T) {
 	// First parent: unreachable.
 	// Second parent: valid.
-	search := &IncomingSearchRequest{
+	search := &protocol.IncomingSearchRequest{
 		Username: "searcher",
 		Token:    42,
 		Query:    "music",
@@ -133,12 +130,12 @@ func TestDistribManager_AdoptsFirstValidParent(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &port)
 	ip := net.ParseIP(host).To4()
 
-	searchReceived := make(chan *IncomingSearchRequest, 1)
-	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
+	searchReceived := make(chan *protocol.IncomingSearchRequest, 1)
+	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
-	parents := []PotentialParent{
+	parents := []protocol.PotentialParent{
 		{Username: "unreachable", IP: net.IPv4(192, 0, 2, 1).To4(), Port: 9999}, // RFC 5737 TEST-NET
 		{Username: "goodparent", IP: ip, Port: uint32(port)},
 	}
@@ -181,20 +178,15 @@ func TestDistribManager_ForwardsMultipleSearches(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn := WrapConn(raw)
+		conn := protocol.WrapConn(raw)
 		conn.ReadMessage() // PeerInit
 
-		conn.WriteMessage(BuildDistribBranchLevel(0))
-		conn.WriteMessage(BuildDistribBranchRoot("root"))
+		conn.WriteMessage(protocol.BuildDistribBranchLevel(0))
+		conn.WriteMessage(protocol.BuildDistribBranchRoot("root"))
 
 		// Send 3 search requests.
 		for i := uint32(1); i <= 3; i++ {
-			b := NewInitBuilder(DistribSearchRequest)
-			b.WriteUint32(distribSearchIdentifier)
-			b.WriteString("user")
-			b.WriteUint32(i)
-			b.WriteString("query")
-			conn.WriteMessage(b.Build())
+			conn.WriteMessage(protocol.BuildDistribSearchRequest("user", i, "query"))
 			time.Sleep(10 * time.Millisecond)
 		}
 
@@ -213,11 +205,11 @@ func TestDistribManager_ForwardsMultipleSearches(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	var count atomic.Int32
-	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
+	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
 		count.Add(1)
 	})
 
-	dm.HandleNetInfo([]PotentialParent{
+	dm.HandleNetInfo([]protocol.PotentialParent{
 		{Username: "root", IP: ip, Port: uint32(port)},
 	})
 
@@ -250,18 +242,13 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn := WrapConn(raw)
+		conn := protocol.WrapConn(raw)
 		conn.ReadMessage() // PeerInit
 
-		conn.WriteMessage(BuildDistribBranchLevel(0))
-		conn.WriteMessage(BuildDistribBranchRoot("root"))
+		conn.WriteMessage(protocol.BuildDistribBranchLevel(0))
+		conn.WriteMessage(protocol.BuildDistribBranchRoot("root"))
 
-		b := NewInitBuilder(DistribSearchRequest)
-		b.WriteUint32(distribSearchIdentifier)
-		b.WriteString("user")
-		b.WriteUint32(1)
-		b.WriteString("query")
-		conn.WriteMessage(b.Build())
+		conn.WriteMessage(protocol.BuildDistribSearchRequest("user", 1, "query"))
 
 		// Disconnect after a brief pause.
 		time.Sleep(100 * time.Millisecond)
@@ -275,14 +262,14 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
+	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:
 		}
 	})
 
-	dm.HandleNetInfo([]PotentialParent{
+	dm.HandleNetInfo([]protocol.PotentialParent{
 		{Username: "root", IP: ip, Port: uint32(port)},
 	})
 
@@ -307,7 +294,7 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 }
 
 func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
-	search := &IncomingSearchRequest{
+	search := &protocol.IncomingSearchRequest{
 		Username: "searcher",
 		Token:    1,
 		Query:    "query",
@@ -320,14 +307,14 @@ func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *IncomingSearchRequest) {
+	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:
 		}
 	})
 
-	parents := []PotentialParent{
+	parents := []protocol.PotentialParent{
 		{Username: "root", IP: ip, Port: uint32(port)},
 	}
 
@@ -345,7 +332,7 @@ func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
 	}
 
 	// Send another NetInfo — should be ignored since we already have a parent.
-	dm.HandleNetInfo([]PotentialParent{
+	dm.HandleNetInfo([]protocol.PotentialParent{
 		{Username: "other", IP: net.IPv4(192, 0, 2, 1).To4(), Port: 9999},
 	})
 
@@ -364,18 +351,18 @@ type distribUpdates struct {
 }
 
 func describeDistribMsg(msg []byte) string {
-	r, err := NewReader(msg)
+	r, err := protocol.NewReader(msg)
 	if err != nil {
 		return ""
 	}
 	switch r.Code() {
-	case ServerHaveNoParent:
+	case protocol.ServerHaveNoParent:
 		v, _ := r.ReadBool()
 		return fmt.Sprintf("HaveNoParent=%v", v)
-	case ServerBranchRoot:
+	case protocol.ServerBranchRoot:
 		v, _ := r.ReadString()
 		return "BranchRoot=" + v
-	case ServerBranchLevel:
+	case protocol.ServerBranchLevel:
 		v, _ := r.ReadUint32()
 		return fmt.Sprintf("BranchLevel=%d", v)
 	}
@@ -387,7 +374,7 @@ func describeDistribMsg(msg []byte) string {
 func loginWithDistrib(t *testing.T, dm *DistribManager) (*Client, *distribUpdates) {
 	t.Helper()
 	u := &distribUpdates{ch: make(chan string, 64)}
-	addr := startMockServer(t, func(sc *Conn) {
+	addr := startMockServer(t, func(sc *protocol.Conn) {
 		handleLogin(t, sc, buildLoginSuccessResponse())
 		for {
 			msg, err := sc.ReadMessage()
@@ -457,19 +444,14 @@ func TestClient_ForwardsParentBranchChanges(t *testing.T) {
 		if err != nil {
 			return
 		}
-		conn := WrapConn(raw)
+		conn := protocol.WrapConn(raw)
 		conn.ReadMessage() // PeerInit
-		conn.WriteMessage(BuildDistribBranchLevel(0))
-		conn.WriteMessage(BuildDistribBranchRoot("root"))
-		b := NewInitBuilder(DistribSearchRequest)
-		b.WriteUint32(distribSearchIdentifier)
-		b.WriteString("s")
-		b.WriteUint32(1)
-		b.WriteString("q")
-		conn.WriteMessage(b.Build())
+		conn.WriteMessage(protocol.BuildDistribBranchLevel(0))
+		conn.WriteMessage(protocol.BuildDistribBranchRoot("root"))
+		conn.WriteMessage(protocol.BuildDistribSearchRequest("s", 1, "q"))
 		<-update
-		conn.WriteMessage(BuildDistribBranchLevel(4))
-		conn.WriteMessage(BuildDistribBranchRoot("newroot"))
+		conn.WriteMessage(protocol.BuildDistribBranchLevel(4))
+		conn.WriteMessage(protocol.BuildDistribBranchRoot("newroot"))
 		for {
 			if _, err := conn.ReadMessage(); err != nil {
 				return
@@ -477,14 +459,14 @@ func TestClient_ForwardsParentBranchChanges(t *testing.T) {
 		}
 	}()
 
-	dm := NewDistribManager("me", func(*IncomingSearchRequest) {})
+	dm := NewDistribManager("me", func(*protocol.IncomingSearchRequest) {})
 	_, u := loginWithDistrib(t, dm)
 	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
 
 	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
 	var port uint32
 	fmt.Sscanf(portStr, "%d", &port)
-	dm.HandleNetInfo([]PotentialParent{{Username: "root", IP: net.ParseIP(host).To4(), Port: port}})
+	dm.HandleNetInfo([]protocol.PotentialParent{{Username: "root", IP: net.ParseIP(host).To4(), Port: port}})
 
 	u.expect(t, "HaveNoParent=false", "BranchRoot=root", "BranchLevel=1")
 	close(update)

@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kalmarv/slsk/protocol"
 )
 
 func TestSearchWorkers_SubmitNeverBlocksAndBoundsQueue(t *testing.T) {
@@ -12,7 +14,7 @@ func TestSearchWorkers_SubmitNeverBlocksAndBoundsQueue(t *testing.T) {
 	defer cancel()
 	release := make(chan struct{})
 	var handled atomic.Int32
-	w := NewSearchWorkers(ctx, 2, 3, func(*IncomingSearchRequest) {
+	w := NewSearchWorkers(ctx, 2, 3, func(*protocol.IncomingSearchRequest) {
 		<-release // a slow share search
 		handled.Add(1)
 	})
@@ -20,7 +22,7 @@ func TestSearchWorkers_SubmitNeverBlocksAndBoundsQueue(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 100; i++ {
-			w.Submit(&IncomingSearchRequest{Token: uint32(i)})
+			w.Submit(&protocol.IncomingSearchRequest{Token: uint32(i)})
 		}
 		close(done)
 	}()
@@ -57,12 +59,12 @@ func TestClient_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
 	defer cancel()
 	release := make(chan struct{})
 	defer close(release)
-	w := NewSearchWorkers(ctx, 1, 1, func(*IncomingSearchRequest) { <-release })
+	w := NewSearchWorkers(ctx, 1, 1, func(*protocol.IncomingSearchRequest) { <-release })
 	client.OnSearchRequest(w.Submit)
 
-	search := NewBuilder(ServerEmbeddedMessage)
+	search := protocol.NewBuilder(protocol.ServerEmbeddedMessage)
 	search.WriteUint8(3)
-	search.WriteUint32(distribSearchIdentifier)
+	search.WriteUint32(49) // distributed search identifier
 	search.WriteString("searcher")
 	search.WriteUint32(1)
 	search.WriteString("query")
@@ -71,7 +73,7 @@ func TestClient_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := sc.WriteMessage(BuildPing()); err != nil {
+	if err := sc.WriteMessage(protocol.BuildPing()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,7 +82,7 @@ func TestClient_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server loop stalled behind the search handler: %v", err)
 	}
-	if r, _ := NewReader(msg); r == nil || r.Code() != ServerPing {
+	if r, _ := protocol.NewReader(msg); r == nil || r.Code() != protocol.ServerPing {
 		t.Fatalf("expected a pong, got %x", msg)
 	}
 }

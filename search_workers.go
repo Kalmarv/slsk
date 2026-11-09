@@ -3,6 +3,8 @@ package slsk
 import (
 	"context"
 	"sync/atomic"
+
+	"github.com/kalmarv/slsk/protocol"
 )
 
 // SearchWorkers runs search-request handling on a bounded worker pool so a slow
@@ -11,14 +13,14 @@ import (
 // searches are best-effort and a flooded peer should shed load, not queue
 // without bound.
 type SearchWorkers struct {
-	queue   chan *IncomingSearchRequest
+	queue   chan *protocol.IncomingSearchRequest
 	dropped atomic.Uint64
 }
 
 // NewSearchWorkers starts workers goroutines that call handle for queued
 // requests until ctx is cancelled. At most depth requests wait in the queue.
-func NewSearchWorkers(ctx context.Context, workers, depth int, handle func(*IncomingSearchRequest)) *SearchWorkers {
-	w := &SearchWorkers{queue: make(chan *IncomingSearchRequest, depth)}
+func NewSearchWorkers(ctx context.Context, workers, depth int, handle func(*protocol.IncomingSearchRequest)) *SearchWorkers {
+	w := &SearchWorkers{queue: make(chan *protocol.IncomingSearchRequest, depth)}
 	for range workers {
 		go func() {
 			for {
@@ -36,7 +38,7 @@ func NewSearchWorkers(ctx context.Context, workers, depth int, handle func(*Inco
 
 // Submit queues a request without blocking. It is a valid callback for
 // Client.OnSearchRequest and the DistribManager.
-func (w *SearchWorkers) Submit(req *IncomingSearchRequest) {
+func (w *SearchWorkers) Submit(req *protocol.IncomingSearchRequest) {
 	select {
 	case w.queue <- req:
 	default:

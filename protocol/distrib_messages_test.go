@@ -1,4 +1,4 @@
-package slsk
+package protocol
 
 import (
 	"testing"

@@ -1,4 +1,4 @@
-package slsk
+package protocol
 
 import "fmt"
 
@@ -64,6 +64,17 @@ func ParseDistribBranchRoot(msg []byte) (string, error) {
 // ---------------------------------------------------------------------------
 // Distributed Search Request (distrib code 3)
 // ---------------------------------------------------------------------------
+
+// BuildDistribSearchRequest builds a distributed search request (distrib code
+// 3), as a parent forwards it to its children.
+func BuildDistribSearchRequest(username string, token uint32, query string) []byte {
+	b := NewInitBuilder(DistribSearchRequest)
+	b.WriteUint32(distribSearchIdentifier)
+	b.WriteString(username)
+	b.WriteUint32(token)
+	b.WriteString(query)
+	return b.Build()
+}
 
 // ParseDistribSearchRequest parses a distributed search request (distrib code 3).
 // Wire format: [4-byte length][1-byte code=3][uint32 identifier=49][string username][uint32 token][string query]
