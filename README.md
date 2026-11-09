@@ -64,3 +64,7 @@ Many users only share with people who share back. To share, implement `ShareInde
 ```sh
 go test -race ./...
 ```
+
+## License
+
+MIT
