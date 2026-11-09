@@ -17,13 +17,14 @@ import (
 
 // newTestPeerManager creates a PeerManager without a real Client (nil),
 // suitable for testing handleIncoming and token management.
-func newTestPeerManager(username string) *PeerManager {
-	return &PeerManager{
+func newTestPeerManager(username string) *peerManager {
+	return &peerManager{
+		log:           testLogger,
 		username:      username,
-		client:        &Client{}, // never logged in: server writes fail
+		client:        &serverConn{log: testLogger}, // never logged in: server writes fail
 		pendingTokens: make(map[uint32]chan connectResult),
 		pendingAddrs:  make(map[string][]chan addrResult),
-		msgHandlers:   make(map[uint32]PeerMessageHandler),
+		msgHandlers:   make(map[uint32]peerMessageHandler),
 	}
 }
 
@@ -65,8 +66,8 @@ func TestPeerManager_HandleIncoming_PeerInit(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	// Register a message handler for a test message code (code 9 = PeerSearchResponse).
-	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
+	received := make(chan *peerMessage, 1)
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *peerMessage) {
 		received <- msg
 	})
 
@@ -100,8 +101,8 @@ func TestPeerManager_HandleIncoming_PeerInit(t *testing.T) {
 func TestPeerManager_HandleIncoming_PeerInit_FileTransfer(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	received := make(chan *PeerConn, 1)
-	pm.OnFileConnection(func(pc *PeerConn) {
+	received := make(chan *peerConn, 1)
+	pm.OnFileConnection(func(pc *peerConn) {
 		received <- pc
 	})
 
@@ -234,8 +235,8 @@ func TestPeerManager_Listen_AcceptsPeerInit(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	// Register a message handler.
-	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
+	received := make(chan *peerMessage, 1)
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *peerMessage) {
 		received <- msg
 	})
 
@@ -589,8 +590,8 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
 	// Register a message handler.
-	received := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *PeerMessage) {
+	received := make(chan *peerMessage, 1)
+	pm.OnPeerMessage(protocol.PeerSearchResponse, func(msg *peerMessage) {
 		received <- msg
 	})
 
@@ -651,8 +652,8 @@ func TestPeerManager_HandleConnectToPeer_PeerType(t *testing.T) {
 func TestPeerManager_HandleConnectToPeer_FileType(t *testing.T) {
 	pm := newTestPeerManager("localuser")
 
-	received := make(chan *PeerConn, 1)
-	pm.OnFileConnection(func(pc *PeerConn) {
+	received := make(chan *peerConn, 1)
+	pm.OnFileConnection(func(pc *peerConn) {
 		received <- pc
 	})
 
@@ -809,9 +810,9 @@ func TestPeerManager_CannotConnect_FailsFast(t *testing.T) {
 func TestGetPeerAddressFailsFastForAllWaiters(t *testing.T) {
 	// A client that is not logged in makes every GetPeerAddress request fail
 	// immediately, which is exactly the "request write failed" path.
-	c, err := NewClient(ClientConfig{ServerAddr: "127.0.0.1:1", Username: "u", Password: "p"})
+	c, err := newServerConn(serverConfig{ServerAddr: "127.0.0.1:1", Username: "u", Password: "p"})
 	require.NoError(t, err)
-	pm := NewPeerManager("u", c)
+	pm := newPeerManager("u", c)
 
 	const n = 3
 	errs := make(chan error, n)
@@ -965,12 +966,12 @@ func TestBuildCantConnectToPeer(t *testing.T) {
 
 // racingPM returns a PeerManager on a logged-in client plus the mock server's
 // connection, so SendConnectToPeer really reaches a (fake) server.
-func racingPM(t *testing.T) (*PeerManager, *protocol.Conn) {
+func racingPM(t *testing.T) (*peerManager, *protocol.Conn) {
 	t.Helper()
 	client, serverSide := connectedClient(t)
 	sc := <-serverSide
 	t.Cleanup(func() { sc.Close() })
-	pm := NewPeerManager("me", client)
+	pm := newPeerManager("me", client)
 	return pm, sc
 }
 
@@ -978,7 +979,7 @@ var testAddr = &protocol.PeerAddressResponse{IP: net.ParseIP("127.0.0.1"), Port:
 
 // deliverIndirect plays the part of handleIncoming matching a PierceFirewall:
 // once the token is pending it hands over a connection and returns its far end.
-func deliverIndirect(t *testing.T, pm *PeerManager, token uint32) net.Conn {
+func deliverIndirect(t *testing.T, pm *peerManager, token uint32) net.Conn {
 	t.Helper()
 	far, near := tcpPair(t)
 	require.Eventually(t, func() bool {
@@ -986,7 +987,7 @@ func deliverIndirect(t *testing.T, pm *PeerManager, token uint32) net.Conn {
 		defer pm.mu.Unlock()
 		ch, ok := pm.pendingTokens[token]
 		if ok {
-			ch <- connectResult{pc: &PeerConn{Conn: protocol.WrapPeerConn(near), Token: token}}
+			ch <- connectResult{pc: &peerConn{Conn: protocol.WrapPeerConn(near), Token: token}}
 		}
 		return ok
 	}, 2*time.Second, 5*time.Millisecond)
@@ -1083,7 +1084,7 @@ func TestConnectRacing_BothFail(t *testing.T) {
 }
 
 // answerPeerAddress fulfils the next GetPeerAddress wait for username.
-func answerPeerAddress(t *testing.T, pm *PeerManager, resp *protocol.PeerAddressResponse) {
+func answerPeerAddress(t *testing.T, pm *peerManager, resp *protocol.PeerAddressResponse) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		pm.mu.Lock()
@@ -1127,8 +1128,8 @@ func TestConnectToPeer_OutboundPConnectionIsRouted(t *testing.T) {
 	far, near := tcpPair(t)
 	pm.dial = func(context.Context, string) (net.Conn, error) { return near, nil }
 
-	got := make(chan *PeerMessage, 1)
-	pm.OnPeerMessage(protocol.PeerTransferResponse, func(m *PeerMessage) { got <- m })
+	got := make(chan *peerMessage, 1)
+	pm.OnPeerMessage(protocol.PeerTransferResponse, func(m *peerMessage) { got <- m })
 
 	go answerPeerAddress(t, pm, &protocol.PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
 	pc, err := pm.ConnectToPeer(context.Background(), "peer", protocol.ConnTypePeer)
@@ -1153,7 +1154,7 @@ func TestConnectToPeer_FileConnectionIsNotRouted(t *testing.T) {
 	pm, _ := racingPM(t)
 	far, near := tcpPair(t)
 	pm.dial = func(context.Context, string) (net.Conn, error) { return near, nil }
-	pm.OnPeerMessage(protocol.PeerTransferResponse, func(*PeerMessage) { t.Error("F connection was routed") })
+	pm.OnPeerMessage(protocol.PeerTransferResponse, func(*peerMessage) { t.Error("F connection was routed") })
 
 	go answerPeerAddress(t, pm, &protocol.PeerAddressResponse{Username: "peer", IP: net.ParseIP("127.0.0.1"), Port: 2234})
 	pc, err := pm.ConnectToPeer(context.Background(), "peer", protocol.ConnTypeTransfer)

@@ -14,31 +14,31 @@ import (
 	"github.com/kalmarv/slsk/protocol"
 )
 
-// PeerConn represents an established peer connection.
-type PeerConn struct {
+// peerConn represents an established peer connection.
+type peerConn struct {
 	Conn     *protocol.Conn
 	Username string
 	Type     string // "P", "F"
 	Token    uint32
 }
 
-// PeerHandler is called when a peer connection is fully established.
-type PeerHandler func(pc *PeerConn)
+// peerHandler is called when a peer connection is fully established.
+type peerHandler func(pc *peerConn)
 
-// PeerMessage represents a message received on a peer connection.
-type PeerMessage struct {
-	PeerConn *PeerConn
+// peerMessage represents a message received on a peer connection.
+type peerMessage struct {
+	PeerConn *peerConn
 	Code     uint32
 	Raw      []byte // full message including length+code prefix
 }
 
-// PeerMessageHandler handles a specific peer message type.
-type PeerMessageHandler func(msg *PeerMessage)
+// peerMessageHandler handles a specific peer message type.
+type peerMessageHandler func(msg *peerMessage)
 
 // connectResult carries either a successful peer connection or an error
 // through the pendingTokens channel, enabling fast failure on CannotConnect.
 type connectResult struct {
-	pc  *PeerConn
+	pc  *peerConn
 	err error
 }
 
@@ -62,22 +62,23 @@ const (
 	peerIdleTimeout = 15 * time.Minute
 )
 
-// PeerManager manages peer connections: listening for incoming,
+// peerManager manages peer connections: listening for incoming,
 // establishing outgoing, and handling the init handshake.
-type PeerManager struct {
+type peerManager struct {
+	log      *slog.Logger
 	username string
-	client   *Client
+	client   *serverConn
 	listener net.Listener
 
 	mu            sync.Mutex
 	pendingTokens map[uint32]chan connectResult // tokens we're waiting for (indirect)
 	pendingAddrs  map[string][]chan addrResult  // username -> waiters for address
-	msgHandlers   map[uint32]PeerMessageHandler // message code -> handler
+	msgHandlers   map[uint32]peerMessageHandler // message code -> handler
 	conns         int                           // open inbound peer connections
 	listening     bool                          // listener bound and accepting
 	listenErr     string                        // last bind failure, "" once bound
 
-	onFileConn PeerHandler // called for incoming F connections
+	onFileConn peerHandler // called for incoming F connections
 
 	// dial opens direct outgoing connections; nil means a plain net.Dialer.
 	// Tests replace it.
@@ -88,16 +89,17 @@ type PeerManager struct {
 // (0.0.0.0:0), which it does for users that are offline.
 var ErrPeerOffline = errors.New("peer is offline")
 
-// NewPeerManager creates a new PeerManager with the given username and client.
+// newPeerManager creates a new PeerManager with the given username and client.
 // It registers for ConnectToPeer server messages to handle indirect peer connections
 // (NAT traversal: peer asks server to tell us to connect to them).
-func NewPeerManager(username string, client *Client) *PeerManager {
-	pm := &PeerManager{
+func newPeerManager(username string, client *serverConn) *peerManager {
+	pm := &peerManager{
+		log:           client.log,
 		username:      username,
 		client:        client,
 		pendingTokens: make(map[uint32]chan connectResult),
 		pendingAddrs:  make(map[string][]chan addrResult),
-		msgHandlers:   make(map[uint32]PeerMessageHandler),
+		msgHandlers:   make(map[uint32]peerMessageHandler),
 	}
 
 	// Handle ConnectToPeer from server: a peer wants us to connect to them.
@@ -128,7 +130,7 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 		pm.mu.Unlock()
 
 		if ok {
-			slog.Debug("CannotConnect failing fast", "component", "peermgr", "token", token)
+			pm.log.Debug("CannotConnect failing fast", "component", "peermgr", "token", token)
 			select {
 			case ch <- connectResult{err: fmt.Errorf("server reported peer cannot connect (token %d)", token)}:
 			default:
@@ -142,14 +144,14 @@ func NewPeerManager(username string, client *Client) *PeerManager {
 // OnPeerMessage registers a handler for a specific peer message code.
 // When a P-type connection receives a message with this code, the handler
 // is called with the message and the connection it arrived on.
-func (pm *PeerManager) OnPeerMessage(code uint32, fn PeerMessageHandler) {
+func (pm *peerManager) OnPeerMessage(code uint32, fn peerMessageHandler) {
 	pm.mu.Lock()
 	pm.msgHandlers[code] = fn
 	pm.mu.Unlock()
 }
 
 // OnFileConnection registers handler for incoming F-type connections.
-func (pm *PeerManager) OnFileConnection(fn PeerHandler) {
+func (pm *peerManager) OnFileConnection(fn peerHandler) {
 	pm.onFileConn = fn
 }
 
@@ -157,7 +159,7 @@ func (pm *PeerManager) OnFileConnection(fn PeerHandler) {
 // cancelled. If the port cannot be bound (still held by a previous process,
 // say) it keeps retrying with backoff rather than leaving inbound connections
 // silently dead; ListenStatus reports the state.
-func (pm *PeerManager) Listen(ctx context.Context, port int) {
+func (pm *peerManager) Listen(ctx context.Context, port int) {
 	ln := pm.bind(ctx, port)
 	if ln == nil {
 		return // cancelled while waiting to bind
@@ -177,7 +179,7 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) {
 			if ctx.Err() != nil {
 				return // context cancelled, clean shutdown
 			}
-			slog.Error("peer accept error", "component", "peermgr", "err", err)
+			pm.log.Error("peer accept error", "component", "peermgr", "err", err)
 			// Back off so a persistent error (e.g. fd exhaustion) cannot spin
 			// the accept loop at 100% CPU.
 			select {
@@ -191,7 +193,7 @@ func (pm *PeerManager) Listen(ctx context.Context, port int) {
 		pm.mu.Lock()
 		if pm.conns >= maxPeerConns {
 			pm.mu.Unlock()
-			slog.Warn("peer connection limit reached, rejecting", "component", "peermgr", "limit", maxPeerConns)
+			pm.log.Warn("peer connection limit reached, rejecting", "component", "peermgr", "limit", maxPeerConns)
 			raw.Close()
 			continue
 		}
@@ -210,17 +212,17 @@ const (
 
 // bind opens the listening socket, retrying until it succeeds or ctx ends (in
 // which case it returns nil).
-func (pm *PeerManager) bind(ctx context.Context, port int) net.Listener {
+func (pm *peerManager) bind(ctx context.Context, port int) net.Listener {
 	delay := bindRetryInitial
 	for {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
 			pm.setListenState(true, "")
-			slog.Info("peer listener started", "component", "peermgr", "port", port)
+			pm.log.Info("peer listener started", "component", "peermgr", "port", port)
 			return ln
 		}
 		pm.setListenState(false, err.Error())
-		slog.Error("peer listener cannot bind, will retry", "component", "peermgr", "port", port, "err", err, "retryIn", delay)
+		pm.log.Error("peer listener cannot bind, will retry", "component", "peermgr", "port", port, "err", err, "retryIn", delay)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -230,7 +232,7 @@ func (pm *PeerManager) bind(ctx context.Context, port int) net.Listener {
 	}
 }
 
-func (pm *PeerManager) setListenState(listening bool, errMsg string) {
+func (pm *peerManager) setListenState(listening bool, errMsg string) {
 	pm.mu.Lock()
 	pm.listening, pm.listenErr = listening, errMsg
 	pm.mu.Unlock()
@@ -238,7 +240,7 @@ func (pm *PeerManager) setListenState(listening bool, errMsg string) {
 
 // ListenStatus reports whether the peer listener is accepting connections
 // and, if not, why the last bind attempt failed.
-func (pm *PeerManager) ListenStatus() (listening bool, lastErr string) {
+func (pm *peerManager) ListenStatus() (listening bool, lastErr string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	return pm.listening, pm.listenErr
@@ -258,7 +260,7 @@ func (c *countedConn) Close() error {
 }
 
 // releaseConn decrements the open inbound peer connection count.
-func (pm *PeerManager) releaseConn() {
+func (pm *peerManager) releaseConn() {
 	pm.mu.Lock()
 	if pm.conns > 0 {
 		pm.conns--
@@ -267,7 +269,7 @@ func (pm *PeerManager) releaseConn() {
 }
 
 // handleIncoming reads the init message from an incoming connection.
-func (pm *PeerManager) handleIncoming(raw net.Conn) {
+func (pm *peerManager) handleIncoming(raw net.Conn) {
 	conn := protocol.WrapPeerConn(raw)
 
 	// Set a deadline for the handshake.
@@ -293,7 +295,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 	if initCode == protocol.InitPierceFirewall {
 		token, err := protocol.ParsePierceFirewall(msg)
 		if err != nil {
-			slog.Warn("PierceFirewall parse error", "component", "peermgr", "err", err)
+			pm.log.Warn("PierceFirewall parse error", "component", "peermgr", "err", err)
 			conn.Close()
 			return
 		}
@@ -304,7 +306,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 		ch, ok := pm.pendingTokens[token]
 		if ok {
 			select {
-			case ch <- connectResult{pc: &PeerConn{Conn: conn, Token: token}}:
+			case ch <- connectResult{pc: &peerConn{Conn: conn, Token: token}}:
 			default:
 				ok = false
 			}
@@ -312,9 +314,9 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 		pm.mu.Unlock()
 
 		if ok {
-			slog.Debug("PierceFirewall matched", "component", "peermgr", "token", token)
+			pm.log.Debug("PierceFirewall matched", "component", "peermgr", "token", token)
 		} else {
-			slog.Debug("PierceFirewall unmatched", "component", "peermgr", "token", token)
+			pm.log.Debug("PierceFirewall unmatched", "component", "peermgr", "token", token)
 			conn.Close()
 		}
 		return
@@ -327,7 +329,7 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 			return
 		}
 
-		pc := &PeerConn{
+		pc := &peerConn{
 			Conn:     conn,
 			Username: init.Username,
 			Type:     init.Type,
@@ -363,15 +365,15 @@ func (pm *PeerManager) handleIncoming(raw net.Conn) {
 // opened to us. Callers must only write to a P connection (and may Close it
 // when done) and must not read from it; replies arrive at the handlers. "F"
 // connections carry raw file data and stay owned by the caller.
-func (pm *PeerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*PeerConn, error) {
+func (pm *peerManager) ConnectToPeer(ctx context.Context, username string, connType string) (*peerConn, error) {
 	return pm.ConnectToPeerWithToken(ctx, username, connType, generateToken())
 }
 
 // ConnectToPeerWithToken is like ConnectToPeer but uses the specified token
 // instead of generating a random one. Used for F-connections where the token
 // must match the transfer token.
-func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username string, connType string, token uint32) (*PeerConn, error) {
-	slog.Debug("getting peer address", "component", "peermgr", "user", username, "type", connType, "token", token)
+func (pm *peerManager) ConnectToPeerWithToken(ctx context.Context, username string, connType string, token uint32) (*peerConn, error) {
+	pm.log.Debug("getting peer address", "component", "peermgr", "user", username, "type", connType, "token", token)
 
 	addr, err := pm.getPeerAddress(ctx, username)
 	if err != nil {
@@ -396,7 +398,7 @@ func (pm *PeerManager) ConnectToPeerWithToken(ctx context.Context, username stri
 // The token is registered before either leg starts so a PierceFirewall that
 // arrives early cannot be missed. The losing leg is cancelled and any
 // connection it produced is closed.
-func (pm *PeerManager) connectRacing(ctx context.Context, addr *protocol.PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
+func (pm *peerManager) connectRacing(ctx context.Context, addr *protocol.PeerAddressResponse, username, connType string, token uint32) (*peerConn, error) {
 	indirect := pm.registerToken(token)
 	defer pm.unregisterToken(token, indirect)
 
@@ -457,7 +459,7 @@ func (pm *PeerManager) connectRacing(ctx context.Context, addr *protocol.PeerAdd
 
 // registerToken registers a pending indirect connection and returns the
 // channel its PierceFirewall (or a CannotConnect error) will be delivered on.
-func (pm *PeerManager) registerToken(token uint32) chan connectResult {
+func (pm *peerManager) registerToken(token uint32) chan connectResult {
 	ch := make(chan connectResult, 1)
 	pm.mu.Lock()
 	pm.pendingTokens[token] = ch
@@ -468,10 +470,10 @@ func (pm *PeerManager) registerToken(token uint32) chan connectResult {
 // unregisterToken removes a pending token. A connection that arrived after
 // the waiter gave up is parked in ch; it is closed so its socket and
 // goroutine are not leaked.
-func (pm *PeerManager) unregisterToken(token uint32, ch chan connectResult) {
+func (pm *peerManager) unregisterToken(token uint32, ch chan connectResult) {
 	pm.mu.Lock()
 	delete(pm.pendingTokens, token)
-	var orphan *PeerConn
+	var orphan *peerConn
 	select {
 	case res := <-ch:
 		orphan = res.pc
@@ -483,7 +485,7 @@ func (pm *PeerManager) unregisterToken(token uint32, ch chan connectResult) {
 	}
 }
 
-func (pm *PeerManager) dialContext(ctx context.Context, addr string) (net.Conn, error) {
+func (pm *peerManager) dialContext(ctx context.Context, addr string) (net.Conn, error) {
 	if pm.dial != nil {
 		return pm.dial(ctx, addr)
 	}
@@ -492,7 +494,7 @@ func (pm *PeerManager) dialContext(ctx context.Context, addr string) (net.Conn, 
 }
 
 // connectDirect dials the peer directly and sends PeerInit.
-func (pm *PeerManager) connectDirect(ctx context.Context, addr *protocol.PeerAddressResponse, username, connType string, token uint32) (*PeerConn, error) {
+func (pm *peerManager) connectDirect(ctx context.Context, addr *protocol.PeerAddressResponse, username, connType string, token uint32) (*peerConn, error) {
 	target := fmt.Sprintf("%s:%d", addr.IP.String(), addr.Port)
 
 	raw, err := pm.dialContext(ctx, target)
@@ -509,7 +511,7 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *protocol.PeerAdd
 		return nil, fmt.Errorf("send peer init: %w", err)
 	}
 
-	return &PeerConn{
+	return &peerConn{
 		Conn:     conn,
 		Username: username,
 		Type:     connType,
@@ -520,12 +522,12 @@ func (pm *PeerManager) connectDirect(ctx context.Context, addr *protocol.PeerAdd
 // handleConnectToPeer handles the server telling us that a peer wants us to
 // connect to them (reverse/indirect connection). We dial the peer and send
 // PierceFirewall with their token, then dispatch based on connection type.
-func (pm *PeerManager) handleConnectToPeer(resp *protocol.ConnectToPeerResponse) {
+func (pm *peerManager) handleConnectToPeer(resp *protocol.ConnectToPeerResponse) {
 	target := fmt.Sprintf("%s:%d", resp.IP.String(), resp.Port)
-	slog.Debug("ConnectToPeer request", "component", "peermgr", "user", resp.Username, "type", resp.Type, "addr", target, "token", resp.Token)
+	pm.log.Debug("ConnectToPeer request", "component", "peermgr", "user", resp.Username, "type", resp.Type, "addr", target, "token", resp.Token)
 
 	if resp.IP.IsUnspecified() || resp.Port == 0 {
-		slog.Debug("cannot honour ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
+		pm.log.Debug("cannot honour ConnectToPeer, invalid address", "component", "peermgr", "user", resp.Username, "addr", target)
 		pm.reportCantConnect(resp)
 		return
 	}
@@ -536,7 +538,7 @@ func (pm *PeerManager) handleConnectToPeer(resp *protocol.ConnectToPeerResponse)
 
 	raw, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
-		slog.Debug("failed to connect to peer", "component", "peermgr", "user", resp.Username, "addr", target, "err", err)
+		pm.log.Debug("failed to connect to peer", "component", "peermgr", "user", resp.Username, "addr", target, "err", err)
 		pm.reportCantConnect(resp)
 		return
 	}
@@ -547,12 +549,12 @@ func (pm *PeerManager) handleConnectToPeer(resp *protocol.ConnectToPeerResponse)
 	pfMsg := protocol.BuildPierceFirewall(resp.Token)
 	if err := conn.WriteMessage(pfMsg); err != nil {
 		conn.Close()
-		slog.Debug("failed to send PierceFirewall", "component", "peermgr", "user", resp.Username, "err", err)
+		pm.log.Debug("failed to send PierceFirewall", "component", "peermgr", "user", resp.Username, "err", err)
 		pm.reportCantConnect(resp)
 		return
 	}
 
-	pc := &PeerConn{
+	pc := &peerConn{
 		Conn:     conn,
 		Username: resp.Username,
 		Type:     resp.Type,
@@ -575,16 +577,16 @@ func (pm *PeerManager) handleConnectToPeer(resp *protocol.ConnectToPeerResponse)
 
 // reportCantConnect tells the server an indirect connection it asked us to
 // make could not be made, so the peer that wanted it fails fast.
-func (pm *PeerManager) reportCantConnect(resp *protocol.ConnectToPeerResponse) {
+func (pm *peerManager) reportCantConnect(resp *protocol.ConnectToPeerResponse) {
 	if err := pm.client.SendCantConnectToPeer(resp.Token, resp.Username); err != nil {
-		slog.Debug("failed to send CantConnectToPeer", "component", "peermgr", "user", resp.Username, "err", err)
+		pm.log.Debug("failed to send CantConnectToPeer", "component", "peermgr", "user", resp.Username, "err", err)
 	}
 }
 
 // routePeerMessages reads messages from a P-type connection and dispatches
 // them to registered handlers by message code. The connection is closed when
 // the peer disconnects or an error occurs.
-func (pm *PeerManager) routePeerMessages(pc *PeerConn) {
+func (pm *peerManager) routePeerMessages(pc *peerConn) {
 	defer pc.Conn.Close()
 
 	for {
@@ -607,13 +609,13 @@ func (pm *PeerManager) routePeerMessages(pc *PeerConn) {
 		pm.mu.Unlock()
 
 		if ok {
-			handler(&PeerMessage{
+			handler(&peerMessage{
 				PeerConn: pc,
 				Code:     code,
 				Raw:      msg,
 			})
 		} else {
-			slog.Debug("unhandled peer message", "component", "peermgr", "code", code, "user", pc.Username, "bytes", len(msg))
+			pm.log.Debug("unhandled peer message", "component", "peermgr", "code", code, "user", pc.Username, "bytes", len(msg))
 		}
 	}
 }
@@ -631,7 +633,7 @@ func isValidAddr(addr *protocol.PeerAddressResponse) bool {
 
 // getPeerAddress requests a peer's address from the server and waits for the response.
 // Deduplicates concurrent requests for the same username. Cleans up on timeout/cancel.
-func (pm *PeerManager) getPeerAddress(ctx context.Context, username string) (*protocol.PeerAddressResponse, error) {
+func (pm *peerManager) getPeerAddress(ctx context.Context, username string) (*protocol.PeerAddressResponse, error) {
 	addrCh := make(chan addrResult, 1)
 
 	pm.mu.Lock()
@@ -668,7 +670,7 @@ func (pm *PeerManager) getPeerAddress(ctx context.Context, username string) (*pr
 }
 
 // failAddrWaiters removes all waiters for username and delivers err to each.
-func (pm *PeerManager) failAddrWaiters(username string, err error) {
+func (pm *peerManager) failAddrWaiters(username string, err error) {
 	pm.mu.Lock()
 	waiters := pm.pendingAddrs[username]
 	delete(pm.pendingAddrs, username)
@@ -683,7 +685,7 @@ func (pm *PeerManager) failAddrWaiters(username string, err error) {
 }
 
 // reissueAddrRequest re-sends a GetPeerAddress request when waiters remain.
-func (pm *PeerManager) reissueAddrRequest(username string) {
+func (pm *peerManager) reissueAddrRequest(username string) {
 	pm.mu.Lock()
 	remaining := len(pm.pendingAddrs[username])
 	pm.mu.Unlock()
@@ -696,7 +698,7 @@ func (pm *PeerManager) reissueAddrRequest(username string) {
 }
 
 // removeAddrWaiter removes a specific channel from pendingAddrs to prevent leaks.
-func (pm *PeerManager) removeAddrWaiter(username string, ch chan addrResult) {
+func (pm *peerManager) removeAddrWaiter(username string, ch chan addrResult) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 

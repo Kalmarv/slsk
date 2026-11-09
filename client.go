@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,477 +12,283 @@ import (
 	"github.com/kalmarv/slsk/protocol"
 )
 
-// ClientConfig holds the configuration for connecting to the Soulseek server.
-type ClientConfig struct {
-	ServerAddr   string // e.g. "server.slsknet.org:2242"
-	Username     string
-	Password     string
-	ListenPort   uint32 // default 2235
-	MajorVersion uint32 // default 170
-	MinorVersion uint32 // default 1
+// DefaultServerAddr is the address of the official Soulseek server.
+const DefaultServerAddr = "server.slsknet.org:2242"
+
+// DefaultListenPort is the port other users connect to when Config.ListenPort
+// is zero. Forward it on your router: peers that cannot accept connections
+// themselves can only reach you through it.
+const DefaultListenPort = 2235
+
+// Config configures a Client. Username and Password are required; every other
+// field has a usable zero value.
+type Config struct {
+	Username string
+	Password string
+
+	// ServerAddr is the Soulseek server to log in to; DefaultServerAddr if empty.
+	ServerAddr string
+	// ListenPort is the TCP port peers connect to; DefaultListenPort if zero.
+	ListenPort int
+
+	// Logger receives the client's logs; slog.Default() if nil.
+	Logger *slog.Logger
+
+	// Shares answers other users' searches. Without it the client shares
+	// nothing: it reports no files to the server and does not join the
+	// distributed search network.
+	Shares ShareIndex
+	// Uploads decides what happens when a user asks to download one of our
+	// files. Without it every request is denied as not shared.
+	Uploads UploadQueue
+	// UploadSpeed is the upload speed in bytes per second advertised in our
+	// search results. Clients rank results by it, so a zero value puts ours
+	// last.
+	UploadSpeed uint32
+
+	// SearchTimeouts bounds outgoing searches; zero fields take the defaults
+	// described on SearchTimeouts.
+	SearchTimeouts SearchTimeouts
+
+	// OnLogin, if set, is called after every successful login, once the
+	// client has re-sent its share counts and watched users. A login follows
+	// every reconnect, so this is where an application resumes work that
+	// needs the server.
+	OnLogin func()
+	// OnUserStatus, if set, is called whenever the server reports a user's
+	// status: in answer to WatchUser, and each time a watched user's status
+	// changes. It runs on the server connection's read loop and must not
+	// block.
+	OnUserStatus func(username string, status UserStatus)
 }
 
-// Client manages a connection to the Soulseek server, handling login,
-// message dispatch, and outgoing requests.
-type Client struct {
-	cfg      ClientConfig
-	conn     *protocol.Conn
-	done     chan struct{} // closed when the current connection's message loop exits
-	loggedIn atomic.Bool
-	mu       sync.Mutex // protects conn, done and lost
-	lost     error      // why the last connection ended; nil while connected
+// UserStatus is a user's presence on the network.
+type UserStatus uint32
 
-	// Event callbacks
-	onSearchRequest func(*protocol.IncomingSearchRequest)
-	onConnectToPeer func(*protocol.ConnectToPeerResponse)
-	onPeerAddress   func(*protocol.PeerAddressResponse)
-	onUserStatus    func(*protocol.UserStatusResponse)
-	onCannotConnect func(token uint32)
+// User statuses, as the server reports them.
+const (
+	StatusOffline UserStatus = 0
+	StatusAway    UserStatus = 1
+	StatusOnline  UserStatus = 2
+)
 
-	distribMgr *DistribManager
-	distribMu  sync.Mutex // serializes distributed-state updates to the server
-
-	excludedPhrases atomic.Pointer[[]string] // from the server's ExcludedSearchPhrases
-}
-
-// NewClient creates a new Client with the given configuration, applying
-// defaults for zero-value fields.
-func NewClient(cfg ClientConfig) (*Client, error) {
-	if cfg.ServerAddr == "" {
-		return nil, errors.New("ServerAddr is required")
+func (s UserStatus) String() string {
+	switch s {
+	case StatusOffline:
+		return "offline"
+	case StatusAway:
+		return "away"
+	case StatusOnline:
+		return "online"
 	}
+	return fmt.Sprintf("status(%d)", uint32(s))
+}
+
+// Status describes the client's connection to the network.
+type Status struct {
+	// LoggedIn is true while the server session is up.
+	LoggedIn bool
+	// Listening is true once the peer listener accepts connections.
+	Listening bool
+	// ListenError is why the listener could not bind, if it can't.
+	ListenError string
+	// LastError is why the last login attempt or session failed.
+	LastError string
+	// RetryAt is when the next login attempt happens; zero unless waiting.
+	RetryAt time.Time
+	// Relogged is true when another client logged in to this account and
+	// took over the session. The client waits before logging in again, so
+	// the two do not keep knocking each other off.
+	Relogged bool
+}
+
+// Client is a Soulseek client: it keeps a session with the server, connects to
+// peers, searches, downloads and, given a ShareIndex and an UploadQueue, shares
+// files. Create one with New and start it with Run; every other method is safe
+// for concurrent use once Run has started.
+type Client struct {
+	cfg Config
+	log *slog.Logger
+
+	server    *serverConn
+	peers     *peerManager
+	searches  *searches
+	downloads *downloads
+	uploads   *uploads
+	sharing   *sharing
+
+	running atomic.Bool
+
+	stateMu sync.Mutex
+	state   Status // LoggedIn, LastError, RetryAt, Relogged; listener fields are live
+
+	watchMu sync.Mutex
+	watched map[string]struct{}
+}
+
+// New returns a Client for cfg. It does not connect: call Run.
+func New(cfg Config) (*Client, error) {
 	if cfg.Username == "" {
-		return nil, errors.New("Username is required")
+		return nil, errors.New("slsk: Username is required")
 	}
 	if cfg.Password == "" {
-		return nil, errors.New("Password is required")
+		return nil, errors.New("slsk: Password is required")
 	}
-
+	if cfg.ServerAddr == "" {
+		cfg.ServerAddr = DefaultServerAddr
+	}
 	if cfg.ListenPort == 0 {
-		cfg.ListenPort = 2235
+		cfg.ListenPort = DefaultListenPort
 	}
-	if cfg.MajorVersion == 0 {
-		cfg.MajorVersion = 170
+	if cfg.ListenPort < 1 || cfg.ListenPort > 65535 {
+		return nil, fmt.Errorf("slsk: ListenPort %d out of range", cfg.ListenPort)
 	}
-	if cfg.MinorVersion == 0 {
-		cfg.MinorVersion = 1
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
+	cfg.SearchTimeouts = cfg.SearchTimeouts.withDefaults()
 
-	return &Client{cfg: cfg}, nil
-}
-
-var errNotLoggedIn = errors.New("not logged in")
-
-// ErrRelogged is the reason a connection ended when the server reported
-// (code 41) that another client logged in to the same account. Reconnecting
-// at once would just kick that client off in turn.
-var ErrRelogged = errors.New("logged in elsewhere (server sent Relogged)")
-
-// loginTimeout bounds the TCP dial plus login handshake.
-const loginTimeout = 30 * time.Second
-
-// write sends a framed message to the server when logged in.
-// It is safe for concurrent use and during a reconnect.
-func (c *Client) write(msg []byte) error {
-	if !c.loggedIn.Load() {
-		return errNotLoggedIn
-	}
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-	if conn == nil {
-		return errNotLoggedIn
-	}
-	return conn.WriteMessage(msg)
-}
-
-// Done returns a channel closed when the current server connection's message
-// loop exits (connection lost or Close called). A fresh channel is created by
-// each successful Connect; it is nil before the first Connect.
-func (c *Client) Done() <-chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.done
-}
-
-// DisconnectReason returns why the most recent connection ended: ErrRelogged,
-// or the read error that dropped it. It is nil while connected and before the
-// first connection.
-func (c *Client) DisconnectReason() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lost
-}
-
-// setLost records why the connection ended, keeping the first reason.
-func (c *Client) setLost(err error) {
-	c.mu.Lock()
-	if c.lost == nil {
-		c.lost = err
-	}
-	c.mu.Unlock()
-}
-
-// Connect dials the Soulseek server, performs login, and on success sends
-// SetListenPort and starts the background message loop.
-func (c *Client) Connect(ctx context.Context) error {
-	// Dial TCP with context deadline.
-	var d net.Dialer
-	raw, err := d.DialContext(ctx, "tcp", c.cfg.ServerAddr)
+	server, err := newServerConn(serverConfig{
+		ServerAddr: cfg.ServerAddr,
+		Username:   cfg.Username,
+		Password:   cfg.Password,
+		ListenPort: uint32(cfg.ListenPort),
+		Logger:     cfg.Logger,
+	})
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", c.cfg.ServerAddr, err)
+		return nil, err
 	}
 
-	conn := protocol.WrapConn(raw)
-	c.mu.Lock()
-	c.conn = conn
-	c.lost = nil
-	c.mu.Unlock()
+	c := &Client{
+		cfg:     cfg,
+		log:     cfg.Logger,
+		server:  server,
+		watched: make(map[string]struct{}),
+	}
+	c.peers = newPeerManager(cfg.Username, server)
+	c.searches = newSearches(c.log, server, c.peers, cfg.SearchTimeouts)
+	c.downloads = newDownloads(c.log, c.peers)
+	c.uploads = newUploads(c.log, c.peers)
+	c.sharing = newSharing(c.log, cfg, c.peers)
 
-	// Bound the login handshake so a half-open connection cannot block the
-	// caller forever. Cleared once the connection is fully established.
-	if err := raw.SetDeadline(time.Now().Add(loginTimeout)); err != nil {
-		conn.Close()
-		return fmt.Errorf("set login deadline: %w", err)
+	server.OnUserStatus(func(resp *protocol.UserStatusResponse) {
+		if c.cfg.OnUserStatus != nil {
+			c.cfg.OnUserStatus(resp.Username, UserStatus(resp.Status))
+		}
+	})
+	return c, nil
+}
+
+// Run connects to the network and keeps the client online until ctx is
+// cancelled: it listens for peers, logs in, and logs in again with backoff
+// whenever a login fails or the server drops the session. It returns nil
+// after ctx is cancelled and the connections are closed. Run may be called
+// only once.
+func (c *Client) Run(ctx context.Context) error {
+	if !c.running.CompareAndSwap(false, true) {
+		return errors.New("slsk: Run called twice")
+	}
+	if c.cfg.Shares != nil {
+		// Searches arrive on the server connection and the distributed
+		// parent connection; both hand them to a bounded worker pool so a
+		// slow share search never stalls their read loops.
+		workers := newSearchWorkers(ctx, searchWorkerCount, searchQueueDepth, func(req *protocol.IncomingSearchRequest) {
+			c.sharing.answer(ctx, req)
+		})
+		c.server.OnSearchRequest(workers.Submit)
+		distrib := newDistribManager(c.cfg.Username, c.log, workers.Submit)
+		c.server.SetDistribManager(distrib)
+		defer distrib.Close()
+		go c.sharing.logStats(ctx, workers)
 	}
 
-	// Send login request.
-	loginMsg := protocol.BuildLoginRequest(c.cfg.Username, c.cfg.Password, c.cfg.MajorVersion, c.cfg.MinorVersion)
-	if err := conn.WriteMessage(loginMsg); err != nil {
-		conn.Close()
-		return fmt.Errorf("send login: %w", err)
-	}
+	go c.peers.Listen(ctx, c.cfg.ListenPort)
+	supervise(ctx, c.log, c.server, c.afterLogin, c.setState, defaultSupervisorTiming)
+	c.server.Close()
+	return nil
+}
 
-	// Read login response.
-	respMsg, err := conn.ReadMessage()
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("read login response: %w", err)
+// afterLogin re-establishes what the server forgets between sessions.
+func (c *Client) afterLogin() {
+	if err := c.reportShares(); err != nil {
+		c.log.Error("report shares", "component", "slsk", "err", err)
 	}
-
-	resp, err := protocol.ParseLoginResponse(respMsg)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("parse login response: %w", err)
+	c.watchMu.Lock()
+	users := make([]string, 0, len(c.watched))
+	for u := range c.watched {
+		users = append(users, u)
 	}
-
-	if !resp.Success {
-		conn.Close()
-		return fmt.Errorf("login failed: %s", resp.Reason)
-	}
-
-	c.loggedIn.Store(true)
-
-	// Post-login initialization: matches soul/Nicotine+ sequence.
-	write := func(msg []byte) func() error { return func() error { return conn.WriteMessage(msg) } }
-	initMsgs := []struct {
-		name string
-		send func() error
-	}{
-		{"CheckPrivileges", write(protocol.BuildCheckPrivileges())},
-		{"SetListenPort", write(protocol.BuildSetListenPort(c.cfg.ListenPort))},
-		{"SetStatus", write(protocol.BuildSetStatus(2))},
-		// The distributed manager keeps its parent across server reconnects,
-		// so report its actual state rather than "no parent".
-		{"DistribState", c.syncDistrib},
-		// We do not implement the child side of the distributed tree, so do
-		// not advertise that we accept children (the server would otherwise
-		// assign us peers we immediately reject).
-		{"AcceptChildren", write(protocol.BuildAcceptChildren(false))},
-	}
-	for _, m := range initMsgs {
-		if err := m.send(); err != nil {
-			c.loggedIn.Store(false)
-			conn.Close()
-			return fmt.Errorf("send %s: %w", m.name, err)
+	c.watchMu.Unlock()
+	for _, u := range users {
+		if err := c.server.WatchUser(u); err != nil {
+			c.log.Error("watch user", "component", "slsk", "user", u, "err", err)
 		}
 	}
-
-	// Start background message loop for this connection.
-	if err := raw.SetDeadline(time.Time{}); err != nil {
-		c.loggedIn.Store(false)
-		conn.Close()
-		return fmt.Errorf("clear login deadline: %w", err)
+	if c.cfg.OnLogin != nil {
+		c.cfg.OnLogin()
 	}
-	done := make(chan struct{})
-	c.mu.Lock()
-	c.done = done
-	c.mu.Unlock()
-	go c.messageLoop(conn, done)
-
-	return nil
 }
 
-// Close closes the connection and marks the client as logged out.
-func (c *Client) Close() error {
-	c.loggedIn.Store(false)
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	if conn != nil {
-		return conn.Close()
-	}
-	return nil
+// Status reports the state of the server session and the peer listener.
+func (c *Client) Status() Status {
+	c.stateMu.Lock()
+	st := c.state
+	c.stateMu.Unlock()
+	st.Listening, st.ListenError = c.peers.ListenStatus()
+	return st
 }
 
-// LoggedIn returns whether the client is currently logged in.
-func (c *Client) LoggedIn() bool {
-	return c.loggedIn.Load()
+func (c *Client) setState(f func(*Status)) {
+	c.stateMu.Lock()
+	f(&c.state)
+	c.stateMu.Unlock()
 }
 
-// ListenPort returns the configured listen port for incoming peer connections.
-func (c *Client) ListenPort() uint32 {
-	return c.cfg.ListenPort
-}
+// LoggedIn reports whether the server session is up.
+func (c *Client) LoggedIn() bool { return c.server.LoggedIn() }
 
-// Search sends a file search request to the server.
-func (c *Client) Search(token uint32, query string) error {
-	return c.write(protocol.BuildFileSearchRequest(token, query))
-}
+// Username returns the account the client logs in as.
+func (c *Client) Username() string { return c.cfg.Username }
 
-// GetPeerAddress sends a GetPeerAddress request to the server.
-func (c *Client) GetPeerAddress(username string) error {
-	return c.write(protocol.BuildGetPeerAddressRequest(username))
-}
-
-// SendConnectToPeer sends a ConnectToPeer request to the server.
-func (c *Client) SendConnectToPeer(token uint32, username, connType string) error {
-	return c.write(protocol.BuildConnectToPeerRequest(token, username, connType))
-}
-
-// SendCantConnectToPeer tells the server we could not connect to the peer of
-// an indirect ConnectToPeer request it relayed to us.
-func (c *Client) SendCantConnectToPeer(token uint32, username string) error {
-	return c.write(protocol.BuildCantConnectToPeer(token, username))
-}
-
-// SendSharedFoldersFiles reports share counts to the server.
-func (c *Client) SendSharedFoldersFiles(dirs, files uint32) error {
-	return c.write(protocol.BuildSharedFoldersFiles(dirs, files))
-}
-
-// OnSearchRequest registers a callback for incoming search requests.
-func (c *Client) OnSearchRequest(fn func(*protocol.IncomingSearchRequest)) {
-	c.onSearchRequest = fn
-}
-
-// OnConnectToPeer registers a callback for ConnectToPeer notifications.
-func (c *Client) OnConnectToPeer(fn func(*protocol.ConnectToPeerResponse)) {
-	c.onConnectToPeer = fn
-}
-
-// OnPeerAddress registers a callback for PeerAddress responses.
-func (c *Client) OnPeerAddress(fn func(*protocol.PeerAddressResponse)) {
-	c.onPeerAddress = fn
-}
-
-// GetUserStatus sends a GetUserStatus request (code 7) for the given username.
-func (c *Client) GetUserStatus(username string) error {
-	return c.write(protocol.BuildGetUserStatusRequest(username))
-}
-
-// WatchUser sends a WatchUser request (code 5) for the given username.
+// WatchUser subscribes to a user's status: Config.OnUserStatus is called with
+// it now and whenever it changes. Subscriptions are renewed after every
+// login, so a user only needs to be watched once.
 func (c *Client) WatchUser(username string) error {
-	return c.write(protocol.BuildWatchUserRequest(username))
-}
-
-// OnUserStatus registers a callback for GetUserStatus responses (code 7).
-// This fires both for explicit GetUserStatus requests and for server-pushed
-// status changes after WatchUser subscriptions.
-func (c *Client) OnUserStatus(fn func(*protocol.UserStatusResponse)) {
-	c.onUserStatus = fn
-}
-
-// OnCannotConnect registers a callback for CannotConnect (code 1001).
-// The server sends this when a peer we asked to connect to us cannot reach us,
-// carrying the token from our original ConnectToPeer request.
-func (c *Client) OnCannotConnect(fn func(token uint32)) {
-	c.onCannotConnect = fn
-}
-
-// SetDistribManager sets the distributed network manager. When set, the client
-// will parse NetInfo (code 102) messages and pass them to the manager, and keep
-// the server informed of the manager's parent, branch level and branch root
-// (on login and whenever they change).
-func (c *Client) SetDistribManager(dm *DistribManager) {
-	c.distribMgr = dm
-	dm.OnChange = func() {
-		if err := c.syncDistrib(); err != nil && !errors.Is(err, errNotLoggedIn) {
-			slog.Error("send distributed state", "component", "slsk", "err", err)
-		}
+	c.watchMu.Lock()
+	c.watched[username] = struct{}{}
+	c.watchMu.Unlock()
+	if !c.server.LoggedIn() {
+		return nil // sent after the next login
 	}
+	return c.server.WatchUser(username)
 }
 
-// syncDistrib tells the server our current place in the distributed tree
-// (HaveNoParent, BranchRoot, BranchLevel). The state is read under distribMu,
-// so racing updates are sent in the order their state was read and the last
-// message always reflects the latest state. Errors while logged out are
-// expected: Connect re-sends the state after each login.
-func (c *Client) syncDistrib() error {
-	c.distribMu.Lock()
-	defer c.distribMu.Unlock()
+// SharesChanged reports the current share counts (Config.Shares.Counts) to
+// the server; call it after the shared files change. The server routes
+// searches only to users who share files. It does nothing while logged out:
+// the counts are sent at every login.
+func (c *Client) SharesChanged() error {
+	if !c.server.LoggedIn() {
+		return nil
+	}
+	return c.reportShares()
+}
 
-	st := DistribState{BranchRoot: c.cfg.Username}
-	if c.distribMgr != nil {
-		st = c.distribMgr.State()
+func (c *Client) reportShares() error {
+	var folders, files int
+	if c.cfg.Shares != nil {
+		folders, files = c.cfg.Shares.Counts()
 	}
-	for _, m := range [][]byte{
-		protocol.BuildHaveNoParent(!st.HasParent),
-		protocol.BuildBranchRoot(st.BranchRoot),
-		protocol.BuildBranchLevel(st.BranchLevel),
-	} {
-		if err := c.write(m); err != nil {
-			return err
-		}
+	if err := c.server.SendSharedFoldersFiles(uint32(folders), uint32(files)); err != nil {
+		return err
 	}
-	slog.Debug("distrib state sent", "component", "slsk", "hasParent", st.HasParent, "level", st.BranchLevel, "root", st.BranchRoot)
+	c.log.Info("reported shares to server", "component", "slsk", "folders", folders, "files", files)
 	return nil
 }
 
-// ExcludedSearchPhrases returns the phrases the server drops
-// searches for, as last sent by the server (nil before the first login).
+// ExcludedSearchPhrases returns the phrases the server silently drops
+// searches for, as it sent them at the last login. Search rewrites queries
+// around them.
 func (c *Client) ExcludedSearchPhrases() []string {
-	if p := c.excludedPhrases.Load(); p != nil {
-		return *p
-	}
-	return nil
-}
-
-// messageLoop reads messages from the server in a loop and dispatches
-// them by code. It runs in a goroutine, owns conn for reads, and closes done
-// when the connection drops.
-func (c *Client) messageLoop(conn *protocol.Conn, done chan struct{}) {
-	defer close(done)
-	for {
-		msg, err := conn.ReadMessage()
-		if err != nil {
-			// net.ErrClosed means we closed it ourselves (Close, shutdown).
-			if errors.Is(err, net.ErrClosed) {
-				slog.Debug("slsk server connection closed", "component", "slsk")
-			} else {
-				slog.Warn("slsk server connection lost", "component", "slsk", "err", err)
-			}
-			c.setLost(err)
-			c.loggedIn.Store(false)
-			_ = conn.Close()
-			return
-		}
-
-		r, err := protocol.NewReader(msg)
-		if err != nil {
-			// Malformed message — skip.
-			continue
-		}
-
-		switch r.Code() {
-		case protocol.ServerPing:
-			// Respond with a ping.
-			pong := protocol.BuildPing()
-			if err := conn.WriteMessage(pong); err != nil {
-				slog.Error("failed to send pong", "component", "slsk", "err", err)
-			}
-
-		case protocol.ServerRelogged:
-			slog.Warn("slsk server reports another client logged in to this account", "component", "slsk")
-			c.setLost(ErrRelogged)
-			c.loggedIn.Store(false)
-			_ = conn.Close()
-			return
-
-		case protocol.ServerEmbeddedMessage:
-			// Incoming search request (code 93).
-			slog.Debug("received EmbeddedMessage", "component", "slsk", "bytes", len(msg))
-			req, err := protocol.ParseServerSearchRequest(msg)
-			if err != nil {
-				slog.Warn("failed to parse search request", "component", "slsk", "err", err)
-				continue
-			}
-			if c.onSearchRequest != nil {
-				c.onSearchRequest(req)
-			}
-
-		case protocol.ServerConnectToPeer:
-			resp, err := protocol.ParseConnectToPeerResponse(msg)
-			if err != nil {
-				slog.Warn("failed to parse connect to peer", "component", "slsk", "err", err)
-				continue
-			}
-			if c.onConnectToPeer != nil {
-				c.onConnectToPeer(resp)
-			}
-
-		case protocol.ServerGetPeerAddress:
-			resp, err := protocol.ParseGetPeerAddressResponse(msg)
-			if err != nil {
-				slog.Warn("failed to parse peer address", "component", "slsk", "err", err)
-				continue
-			}
-			if c.onPeerAddress != nil {
-				c.onPeerAddress(resp)
-			}
-
-		case protocol.ServerWatchUser:
-			resp, err := protocol.ParseWatchUserResponse(msg)
-			if err != nil {
-				slog.Warn("failed to parse watch user response", "component", "slsk", "err", err)
-				continue
-			}
-			if resp.Exists && c.onUserStatus != nil {
-				c.onUserStatus(&protocol.UserStatusResponse{
-					Username: resp.Username,
-					Status:   resp.Status,
-				})
-			}
-
-		case protocol.ServerGetStatus:
-			resp, err := protocol.ParseGetUserStatusResponse(msg)
-			if err != nil {
-				slog.Warn("failed to parse user status", "component", "slsk", "err", err)
-				continue
-			}
-			if c.onUserStatus != nil {
-				c.onUserStatus(resp)
-			}
-
-		case protocol.ServerCannotConnect:
-			token, err := protocol.ParseCannotConnect(msg)
-			if err != nil {
-				slog.Warn("failed to parse CannotConnect", "component", "slsk", "err", err)
-				continue
-			}
-			slog.Debug("CannotConnect", "component", "slsk", "token", token)
-			if c.onCannotConnect != nil {
-				c.onCannotConnect(token)
-			}
-
-		case protocol.ServerNetInfo:
-			parents, err := protocol.ParseNetInfo(msg)
-			if err != nil {
-				slog.Warn("failed to parse net info", "component", "slsk", "err", err)
-				continue
-			}
-			if c.distribMgr != nil && len(parents) > 0 {
-				slog.Debug("received potential parents", "component", "slsk", "count", len(parents))
-				c.distribMgr.HandleNetInfo(parents)
-			}
-
-		case protocol.ServerCheckPrivileges, protocol.ServerRoomList, protocol.ServerPrivilegedUsers,
-			protocol.ServerParentMinSpeed, protocol.ServerParentSpeedRatio,
-			protocol.ServerWishlistInterval:
-			// Known server messages we don't need to handle.
-
-		case protocol.ServerExcludedPhrases:
-			phrases, err := protocol.ParseExcludedSearchPhrases(msg)
-			if err != nil {
-				slog.Warn("failed to parse excluded search phrases", "component", "slsk", "err", err)
-				continue
-			}
-			c.excludedPhrases.Store(&phrases)
-			slog.Info("received excluded search phrases", "component", "slsk", "count", len(phrases), "phrases", phrases)
-
-		default:
-			slog.Debug("unhandled server message", "component", "slsk", "code", r.Code(), "bytes", len(msg))
-		}
-	}
+	return c.server.ExcludedSearchPhrases()
 }

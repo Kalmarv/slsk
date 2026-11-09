@@ -76,7 +76,7 @@ func TestDistribManager_ConnectsToParent(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan *protocol.IncomingSearchRequest, 1)
-	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
+	dm := newDistribManager("testuser", testLogger, func(s *protocol.IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
@@ -131,7 +131,7 @@ func TestDistribManager_AdoptsFirstValidParent(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan *protocol.IncomingSearchRequest, 1)
-	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
+	dm := newDistribManager("testuser", testLogger, func(s *protocol.IncomingSearchRequest) {
 		searchReceived <- s
 	})
 
@@ -205,7 +205,7 @@ func TestDistribManager_ForwardsMultipleSearches(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	var count atomic.Int32
-	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
+	dm := newDistribManager("testuser", testLogger, func(s *protocol.IncomingSearchRequest) {
 		count.Add(1)
 	})
 
@@ -262,7 +262,7 @@ func TestDistribManager_ParentDisconnectResetsState(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
+	dm := newDistribManager("testuser", testLogger, func(s *protocol.IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:
@@ -307,7 +307,7 @@ func TestDistribManager_IgnoresNetInfoWhenHasParent(t *testing.T) {
 	ip := net.ParseIP(host).To4()
 
 	searchReceived := make(chan struct{}, 1)
-	dm := NewDistribManager("testuser", func(s *protocol.IncomingSearchRequest) {
+	dm := newDistribManager("testuser", testLogger, func(s *protocol.IncomingSearchRequest) {
 		select {
 		case searchReceived <- struct{}{}:
 		default:
@@ -371,7 +371,7 @@ func describeDistribMsg(msg []byte) string {
 
 // loginWithDistrib logs a client with the given manager into a mock server and
 // returns the distributed-state messages the server saw, in order.
-func loginWithDistrib(t *testing.T, dm *DistribManager) (*Client, *distribUpdates) {
+func loginWithDistrib(t *testing.T, dm *distribManager) (*serverConn, *distribUpdates) {
 	t.Helper()
 	u := &distribUpdates{ch: make(chan string, 64)}
 	addr := startMockServer(t, func(sc *protocol.Conn) {
@@ -386,7 +386,7 @@ func loginWithDistrib(t *testing.T, dm *DistribManager) (*Client, *distribUpdate
 			}
 		}
 	})
-	c, err := NewClient(ClientConfig{ServerAddr: addr, Username: "me", Password: "p"})
+	c, err := newServerConn(serverConfig{ServerAddr: addr, Username: "me", Password: "p"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,23 +416,23 @@ func (u *distribUpdates) expect(t *testing.T, want ...string) {
 	}
 }
 
-func TestClient_LoginWithoutParentReportsNoParent(t *testing.T) {
-	dm := NewDistribManager("me", nil)
+func TestServerConn_LoginWithoutParentReportsNoParent(t *testing.T) {
+	dm := newDistribManager("me", testLogger, nil)
 	_, u := loginWithDistrib(t, dm)
 	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
 }
 
 // The manager keeps its parent when the server connection drops, so the next
 // login must report that parent instead of claiming to have none.
-func TestClient_LoginResyncsExistingParent(t *testing.T) {
-	dm := NewDistribManager("me", nil)
+func TestServerConn_LoginResyncsExistingParent(t *testing.T) {
+	dm := newDistribManager("me", testLogger, nil)
 	dm.hasParent, dm.branchLvl, dm.branchRoot = true, 3, "root"
 	_, u := loginWithDistrib(t, dm)
 	u.expect(t, "HaveNoParent=false", "BranchRoot=root", "BranchLevel=3")
 }
 
 // Branch level/root changes announced by the parent are forwarded to the server.
-func TestClient_ForwardsParentBranchChanges(t *testing.T) {
+func TestServerConn_ForwardsParentBranchChanges(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -459,7 +459,7 @@ func TestClient_ForwardsParentBranchChanges(t *testing.T) {
 		}
 	}()
 
-	dm := NewDistribManager("me", func(*protocol.IncomingSearchRequest) {})
+	dm := newDistribManager("me", testLogger, func(*protocol.IncomingSearchRequest) {})
 	_, u := loginWithDistrib(t, dm)
 	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
 
@@ -477,8 +477,8 @@ func TestClient_ForwardsParentBranchChanges(t *testing.T) {
 
 // Concurrent state changes must not be reordered on the wire: whatever the
 // interleaving, the last state the server hears is the manager's final state.
-func TestClient_ConcurrentParentChangesEndInFinalState(t *testing.T) {
-	dm := NewDistribManager("me", nil)
+func TestServerConn_ConcurrentParentChangesEndInFinalState(t *testing.T) {
+	dm := newDistribManager("me", testLogger, nil)
 	_, u := loginWithDistrib(t, dm)
 	u.expect(t, "HaveNoParent=true", "BranchRoot=me", "BranchLevel=0")
 

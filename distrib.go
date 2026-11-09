@@ -11,11 +11,12 @@ import (
 	"github.com/kalmarv/slsk/protocol"
 )
 
-// DistribManager manages the distributed search network parent connection.
+// distribManager manages the distributed search network parent connection.
 // It connects to candidate parents from NetInfo (code 102), adopts the first
 // one that sends BranchLevel + BranchRoot + a search request, and forwards
 // all received searches to a callback.
-type DistribManager struct {
+type distribManager struct {
+	log      *slog.Logger
 	username string
 	onSearch func(*protocol.IncomingSearchRequest)
 
@@ -34,33 +35,34 @@ type DistribManager struct {
 	OnChange func()
 }
 
-// DistribState is a consistent snapshot of what the server must be told about
+// distribState is a consistent snapshot of what the server must be told about
 // our place in the distributed tree.
-type DistribState struct {
+type distribState struct {
 	HasParent   bool
 	BranchLevel uint32 // 0 without a parent
 	BranchRoot  string // our own username without a parent
 }
 
 // State returns the current distributed state.
-func (dm *DistribManager) State() DistribState {
+func (dm *distribManager) State() distribState {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	if !dm.hasParent {
-		return DistribState{BranchRoot: dm.username}
+		return distribState{BranchRoot: dm.username}
 	}
-	return DistribState{HasParent: true, BranchLevel: dm.branchLvl, BranchRoot: dm.branchRoot}
+	return distribState{HasParent: true, BranchLevel: dm.branchLvl, BranchRoot: dm.branchRoot}
 }
 
-func (dm *DistribManager) changed() {
+func (dm *distribManager) changed() {
 	if dm.OnChange != nil {
 		dm.OnChange()
 	}
 }
 
-// NewDistribManager creates a new DistribManager.
-func NewDistribManager(username string, onSearch func(*protocol.IncomingSearchRequest)) *DistribManager {
-	return &DistribManager{
+// newDistribManager creates a new DistribManager.
+func newDistribManager(username string, log *slog.Logger, onSearch func(*protocol.IncomingSearchRequest)) *distribManager {
+	return &distribManager{
+		log:      log,
 		username: username,
 		onSearch: onSearch,
 	}
@@ -69,7 +71,7 @@ func NewDistribManager(username string, onSearch func(*protocol.IncomingSearchRe
 // HandleNetInfo processes a list of potential parents from the server (code 102).
 // If we already have a parent, the list is ignored. Otherwise, we try each
 // candidate in order and adopt the first one that completes the handshake.
-func (dm *DistribManager) HandleNetInfo(parents []protocol.PotentialParent) {
+func (dm *distribManager) HandleNetInfo(parents []protocol.PotentialParent) {
 	dm.mu.Lock()
 	if dm.hasParent || dm.closed {
 		dm.mu.Unlock()
@@ -81,7 +83,7 @@ func (dm *DistribManager) HandleNetInfo(parents []protocol.PotentialParent) {
 }
 
 // tryParents attempts to connect to each candidate parent in order.
-func (dm *DistribManager) tryParents(parents []protocol.PotentialParent) {
+func (dm *distribManager) tryParents(parents []protocol.PotentialParent) {
 	for _, p := range parents {
 		dm.mu.Lock()
 		if dm.hasParent || dm.closed {
@@ -98,7 +100,7 @@ func (dm *DistribManager) tryParents(parents []protocol.PotentialParent) {
 
 // tryOneParent attempts to connect to a single candidate parent.
 // Returns true if the parent was adopted.
-func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
+func (dm *distribManager) tryOneParent(p protocol.PotentialParent) bool {
 	target := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -107,7 +109,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 	var d net.Dialer
 	raw, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
-		slog.Debug("failed to connect to parent", "component", "distrib", "user", p.Username, "addr", target, "err", err)
+		dm.log.Debug("failed to connect to parent", "component", "distrib", "user", p.Username, "addr", target, "err", err)
 		return false
 	}
 
@@ -117,7 +119,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 	initMsg := protocol.BuildPeerInit(dm.username, protocol.ConnTypeDistributed, 0)
 	if err := conn.WriteMessage(initMsg); err != nil {
 		conn.Close()
-		slog.Debug("failed to send PeerInit", "component", "distrib", "user", p.Username, "err", err)
+		dm.log.Debug("failed to send PeerInit", "component", "distrib", "user", p.Username, "err", err)
 		return false
 	}
 
@@ -146,7 +148,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 		case protocol.DistribBranchLevel:
 			level, err = protocol.ParseDistribBranchLevel(msg)
 			if err != nil {
-				slog.Warn("parse branch level", "component", "distrib", "user", p.Username, "err", err)
+				dm.log.Warn("parse branch level", "component", "distrib", "user", p.Username, "err", err)
 				conn.Close()
 				return false
 			}
@@ -155,7 +157,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 		case protocol.DistribBranchRoot:
 			root, err = protocol.ParseDistribBranchRoot(msg)
 			if err != nil {
-				slog.Warn("parse branch root", "component", "distrib", "user", p.Username, "err", err)
+				dm.log.Warn("parse branch root", "component", "distrib", "user", p.Username, "err", err)
 				conn.Close()
 				return false
 			}
@@ -182,7 +184,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 			dm.hasParent = true
 			dm.mu.Unlock()
 
-			slog.Info("adopted parent", "component", "distrib", "user", p.Username, "level", level, "root", root)
+			dm.log.Info("adopted parent", "component", "distrib", "user", p.Username, "level", level, "root", root)
 
 			dm.changed()
 
@@ -200,7 +202,7 @@ func (dm *DistribManager) tryOneParent(p protocol.PotentialParent) bool {
 
 // readLoop reads distributed messages from the parent connection
 // and forwards search requests to the callback.
-func (dm *DistribManager) readLoop(conn *protocol.Conn, parentUsername string) {
+func (dm *distribManager) readLoop(conn *protocol.Conn, parentUsername string) {
 	defer func() {
 		conn.Close()
 		dm.mu.Lock()
@@ -211,7 +213,7 @@ func (dm *DistribManager) readLoop(conn *protocol.Conn, parentUsername string) {
 		dm.branchRoot = ""
 		dm.mu.Unlock()
 
-		slog.Info("parent disconnected", "component", "distrib", "user", parentUsername)
+		dm.log.Info("parent disconnected", "component", "distrib", "user", parentUsername)
 
 		dm.changed()
 	}()
@@ -232,7 +234,7 @@ func (dm *DistribManager) readLoop(conn *protocol.Conn, parentUsername string) {
 		case protocol.DistribSearchRequest:
 			search, err := protocol.ParseDistribSearchRequest(msg)
 			if err != nil {
-				slog.Warn("parse search", "component", "distrib", "user", parentUsername, "err", err)
+				dm.log.Warn("parse search", "component", "distrib", "user", parentUsername, "err", err)
 				continue
 			}
 			if dm.onSearch != nil {
@@ -267,35 +269,35 @@ func (dm *DistribManager) readLoop(conn *protocol.Conn, parentUsername string) {
 }
 
 // HasParent returns whether we currently have an adopted distributed parent.
-func (dm *DistribManager) HasParent() bool {
+func (dm *distribManager) HasParent() bool {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	return dm.hasParent
 }
 
 // ParentUsername returns the username of the current parent, or "" if none.
-func (dm *DistribManager) ParentUsername() string {
+func (dm *distribManager) ParentUsername() string {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	return dm.parentUser
 }
 
 // BranchLevel returns our current branch level (parent's level + 1).
-func (dm *DistribManager) BranchLevel() uint32 {
+func (dm *distribManager) BranchLevel() uint32 {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	return dm.branchLvl
 }
 
 // BranchRoot returns the root username of our branch.
-func (dm *DistribManager) BranchRoot() string {
+func (dm *distribManager) BranchRoot() string {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	return dm.branchRoot
 }
 
 // Close shuts down the distributed manager and disconnects from any parent.
-func (dm *DistribManager) Close() {
+func (dm *distribManager) Close() {
 	dm.mu.Lock()
 	dm.closed = true
 	conn := dm.parentConn

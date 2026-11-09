@@ -7,20 +7,20 @@ import (
 	"github.com/kalmarv/slsk/protocol"
 )
 
-// SearchWorkers runs search-request handling on a bounded worker pool so a slow
+// searchWorkers runs search-request handling on a bounded worker pool so a slow
 // share search cannot stall the goroutine that reads a connection (the server
 // loop or the distributed parent). Requests beyond the queue depth are dropped:
 // searches are best-effort and a flooded peer should shed load, not queue
 // without bound.
-type SearchWorkers struct {
+type searchWorkers struct {
 	queue   chan *protocol.IncomingSearchRequest
 	dropped atomic.Uint64
 }
 
-// NewSearchWorkers starts workers goroutines that call handle for queued
+// newSearchWorkers starts workers goroutines that call handle for queued
 // requests until ctx is cancelled. At most depth requests wait in the queue.
-func NewSearchWorkers(ctx context.Context, workers, depth int, handle func(*protocol.IncomingSearchRequest)) *SearchWorkers {
-	w := &SearchWorkers{queue: make(chan *protocol.IncomingSearchRequest, depth)}
+func newSearchWorkers(ctx context.Context, workers, depth int, handle func(*protocol.IncomingSearchRequest)) *searchWorkers {
+	w := &searchWorkers{queue: make(chan *protocol.IncomingSearchRequest, depth)}
 	for range workers {
 		go func() {
 			for {
@@ -38,7 +38,7 @@ func NewSearchWorkers(ctx context.Context, workers, depth int, handle func(*prot
 
 // Submit queues a request without blocking. It is a valid callback for
 // Client.OnSearchRequest and the DistribManager.
-func (w *SearchWorkers) Submit(req *protocol.IncomingSearchRequest) {
+func (w *searchWorkers) Submit(req *protocol.IncomingSearchRequest) {
 	select {
 	case w.queue <- req:
 	default:
@@ -47,4 +47,4 @@ func (w *SearchWorkers) Submit(req *protocol.IncomingSearchRequest) {
 }
 
 // Dropped returns how many requests were shed because the queue was full.
-func (w *SearchWorkers) Dropped() uint64 { return w.dropped.Load() }
+func (w *searchWorkers) Dropped() uint64 { return w.dropped.Load() }

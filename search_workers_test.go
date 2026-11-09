@@ -14,7 +14,7 @@ func TestSearchWorkers_SubmitNeverBlocksAndBoundsQueue(t *testing.T) {
 	defer cancel()
 	release := make(chan struct{})
 	var handled atomic.Int32
-	w := NewSearchWorkers(ctx, 2, 3, func(*protocol.IncomingSearchRequest) {
+	w := newSearchWorkers(ctx, 2, 3, func(*protocol.IncomingSearchRequest) {
 		<-release // a slow share search
 		handled.Add(1)
 	})
@@ -50,7 +50,7 @@ func TestSearchWorkers_SubmitNeverBlocksAndBoundsQueue(t *testing.T) {
 }
 
 // A slow search handler must not stall the server message loop.
-func TestClient_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
+func TestServerConn_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
 	client, serverSide := connectedClient(t)
 	sc := <-serverSide
 	defer sc.Close()
@@ -59,7 +59,7 @@ func TestClient_SlowSearchHandlerDoesNotStallServerLoop(t *testing.T) {
 	defer cancel()
 	release := make(chan struct{})
 	defer close(release)
-	w := NewSearchWorkers(ctx, 1, 1, func(*protocol.IncomingSearchRequest) { <-release })
+	w := newSearchWorkers(ctx, 1, 1, func(*protocol.IncomingSearchRequest) { <-release })
 	client.OnSearchRequest(w.Submit)
 
 	search := protocol.NewBuilder(protocol.ServerEmbeddedMessage)

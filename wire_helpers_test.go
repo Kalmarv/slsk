@@ -1,6 +1,12 @@
 package slsk
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"log/slog"
+)
+
+// testLogger discards the log output of the code under test.
+var testLogger = slog.New(slog.DiscardHandler)
 
 // buildMsg constructs a raw wire message from code and payload bytes.
 // Format: [4-byte LE length][4-byte LE code][payload]
